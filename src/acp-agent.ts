@@ -238,12 +238,8 @@ export type ToolUpdateMeta = {
     subagentName?: string;
     /* Subagent color, e.g. 'blue'. */
     subagentColor?: string;
-    /* Current activity description from a task_progress message. */
-    taskDescription?: string;
     /* Last tool name used by the subagent, from task_progress. */
     taskLastToolName?: string;
-    /* AI-generated progress summary from task_progress or task_notification. */
-    taskSummary?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -718,9 +714,7 @@ export class ClaudeAcpAgent implements Agent {
                 await this.onTaskProgress(
                   message.tool_use_id,
                   message.task_id,
-                  message.description,
                   message.last_tool_name,
-                  message.summary,
                   params.sessionId,
                 );
                 break;
@@ -730,7 +724,6 @@ export class ClaudeAcpAgent implements Agent {
                   message.tool_use_id,
                   message.task_id,
                   message.status,
-                  message.summary,
                   params.sessionId,
                 );
                 break;
@@ -1603,7 +1596,6 @@ export class ClaudeAcpAgent implements Agent {
           },
         ],
       },
-      agentProgressSummaries: true,
       ...creationOpts,
       abortController,
     };
@@ -1852,9 +1844,7 @@ export class ClaudeAcpAgent implements Agent {
           await this.onTaskProgress(
             message.tool_use_id,
             message.task_id,
-            message.description,
             message.last_tool_name,
-            message.summary,
             sessionId,
           );
         } else if (message.subtype === "task_notification") {
@@ -1862,7 +1852,6 @@ export class ClaudeAcpAgent implements Agent {
             message.tool_use_id,
             message.task_id,
             message.status,
-            message.summary,
             sessionId,
           );
         }
@@ -1880,9 +1869,7 @@ export class ClaudeAcpAgent implements Agent {
   private async onTaskProgress(
     toolUseId: string | undefined,
     taskId: string,
-    description: string,
     lastToolName: string | undefined,
-    summary: string | undefined,
     sessionId: string,
   ): Promise<void> {
     const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
@@ -1896,9 +1883,7 @@ export class ClaudeAcpAgent implements Agent {
             subagentId: subagent?.agentId ?? taskId,
             subagentName: subagent?.name,
             subagentColor: subagent?.color,
-            taskDescription: description,
             taskLastToolName: lastToolName,
-            taskSummary: summary,
           },
         } satisfies ToolUpdateMeta,
         toolCallId: toolUseId ?? taskId,
@@ -1915,7 +1900,6 @@ export class ClaudeAcpAgent implements Agent {
     toolUseId: string | undefined,
     taskId: string,
     status: "completed" | "failed" | "stopped",
-    summary: string,
     sessionId: string,
   ): Promise<void> {
     const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
@@ -1929,7 +1913,6 @@ export class ClaudeAcpAgent implements Agent {
             subagentId: subagent?.agentId ?? taskId,
             subagentName: subagent?.name,
             subagentColor: subagent?.color,
-            taskSummary: summary,
           },
         } satisfies ToolUpdateMeta,
         toolCallId: toolUseId ?? taskId,
