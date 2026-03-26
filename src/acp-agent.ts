@@ -1704,10 +1704,12 @@ export class ClaudeAcpAgent implements Agent {
     const toolUse = this.toolUseCache[toolUseId];
     if (!toolUse || (toolUse.name !== "Agent" && toolUse.name !== "Task")) return;
 
-    const input = toolUse.input as { name?: string; description?: string };
+    const input = toolUse.input as { name?: string; description?: string; color?: string };
+    const agentName = (input.name || input.description || description).trim();
     this.subagentCache.set(toolUseId, {
       agentId: taskId,
-      name: (input.name || input.description || description).trim(),
+      name: agentName,
+      color: input.color,
     });
 
     await this.client.sessionUpdate({
@@ -1717,6 +1719,9 @@ export class ClaudeAcpAgent implements Agent {
           claudeCode: {
             toolName: toolUse.name,
             status: "teammate_spawned",
+            subagentId: taskId,
+            subagentName: agentName,
+            subagentColor: input.color,
           },
         } satisfies ToolUpdateMeta,
         toolCallId: toolUseId,
