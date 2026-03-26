@@ -238,6 +238,12 @@ export type ToolUpdateMeta = {
     subagentName?: string;
     /* Subagent color, e.g. 'blue'. */
     subagentColor?: string;
+    /* Current activity description from a task_progress message. */
+    taskDescription?: string;
+    /* Last tool name used by the subagent, from task_progress. */
+    taskLastToolName?: string;
+    /* AI-generated progress summary from task_progress or task_notification. */
+    taskSummary?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -708,13 +714,32 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 break;
               }
+              case "task_progress": {
+                await this.onTaskProgress(
+                  message.tool_use_id,
+                  message.task_id,
+                  message.description,
+                  message.last_tool_name,
+                  message.summary,
+                  params.sessionId,
+                );
+                break;
+              }
+              case "task_notification": {
+                await this.onTaskNotification(
+                  message.tool_use_id,
+                  message.task_id,
+                  message.status,
+                  message.summary,
+                  params.sessionId,
+                );
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_notification":
-              case "task_progress":
-              case "task_updated":
+
               case "elicitation_complete":
               case "plugin_install":
               case "memory_recall":
@@ -1578,6 +1603,7 @@ export class ClaudeAcpAgent implements Agent {
           },
         ],
       },
+      agentProgressSummaries: true,
       ...creationOpts,
       abortController,
     };
@@ -1822,12 +1848,94 @@ export class ClaudeAcpAgent implements Agent {
             message.description,
             sessionId,
           );
+        } else if (message.subtype === "task_progress") {
+          await this.onTaskProgress(
+            message.tool_use_id,
+            message.task_id,
+            message.description,
+            message.last_tool_name,
+            message.summary,
+            sessionId,
+          );
+        } else if (message.subtype === "task_notification") {
+          await this.onTaskNotification(
+            message.tool_use_id,
+            message.task_id,
+            message.status,
+            message.summary,
+            sessionId,
+          );
         }
         break;
       }
       default:
         break;
     }
+  }
+
+  /**
+   * Called when a task_progress system message arrives.
+   * Emits a tool_call_update with status 'task_progress' so ACPX can observe subagent activity.
+   */
+  private async onTaskProgress(
+    toolUseId: string | undefined,
+    taskId: string,
+    description: string,
+    lastToolName: string | undefined,
+    summary: string | undefined,
+    sessionId: string,
+  ): Promise<void> {
+    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        _meta: {
+          claudeCode: {
+            toolName: "Agent",
+            status: "task_progress",
+            subagentId: subagent?.agentId ?? taskId,
+            subagentName: subagent?.name,
+            subagentColor: subagent?.color,
+            taskDescription: description,
+            taskLastToolName: lastToolName,
+            taskSummary: summary,
+          },
+        } satisfies ToolUpdateMeta,
+        toolCallId: toolUseId ?? taskId,
+        sessionUpdate: "tool_call_update",
+      },
+    });
+  }
+
+  /**
+   * Called when a task_notification system message arrives (task completed/failed/stopped).
+   * Emits a tool_call_update with status 'task_completed', 'task_failed', or 'task_stopped'.
+   */
+  private async onTaskNotification(
+    toolUseId: string | undefined,
+    taskId: string,
+    status: "completed" | "failed" | "stopped",
+    summary: string,
+    sessionId: string,
+  ): Promise<void> {
+    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        _meta: {
+          claudeCode: {
+            toolName: "Agent",
+            status: `task_${status}`,
+            subagentId: subagent?.agentId ?? taskId,
+            subagentName: subagent?.name,
+            subagentColor: subagent?.color,
+            taskSummary: summary,
+          },
+        } satisfies ToolUpdateMeta,
+        toolCallId: toolUseId ?? taskId,
+        sessionUpdate: "tool_call_update",
+      },
+    });
   }
 
   /**
