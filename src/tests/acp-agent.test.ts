@@ -1350,7 +1350,10 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
@@ -1491,7 +1494,10 @@ describe("stop reason propagation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -1566,6 +1572,8 @@ describe("session/close", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
     };
     return agent.sessions[sessionId]!;
   }
