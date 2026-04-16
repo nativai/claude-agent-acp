@@ -1668,6 +1668,8 @@ describe("getOrCreateSession param change detection", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
     };
     return agent.sessions[sessionId]!;
   }
@@ -1883,7 +1885,10 @@ describe("usage_update computation", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   it("used sums all token types as post-turn context occupancy proxy", async () => {
@@ -2263,7 +2268,10 @@ describe("emitRawSDKMessages", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages,
+      activePromptResolve: null,
+      backgroundLoopError: null,
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   function createResultMessage() {

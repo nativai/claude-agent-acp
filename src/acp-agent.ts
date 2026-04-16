@@ -732,7 +732,7 @@ export class ClaudeAcpAgent implements Agent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-
+              case "task_updated":
               case "elicitation_complete":
               case "plugin_install":
               case "memory_recall":
@@ -1756,7 +1756,16 @@ export class ClaudeAcpAgent implements Agent {
             session.activePromptResolve = null;
             resolve(value);
           } else {
-            // Idle: forward teammate activity as session/update notifications.
+            // Idle: emit raw SDK message if configured, then forward.
+            if (
+              session.emitRawSDKMessages &&
+              shouldEmitRawMessage(session.emitRawSDKMessages, value)
+            ) {
+              await this.client.extNotification("_claude/sdkMessage", {
+                sessionId,
+                message: value as Record<string, unknown>,
+              });
+            }
             await this.handleIdleMessage(value, sessionId);
           }
         }
