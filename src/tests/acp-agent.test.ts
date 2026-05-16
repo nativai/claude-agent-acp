@@ -1534,9 +1534,12 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
@@ -1678,9 +1681,12 @@ describe("stop reason propagation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -1837,6 +1843,8 @@ describe("session/close", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
@@ -1934,6 +1942,8 @@ describe("getOrCreateSession param change detection", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
@@ -2169,9 +2179,12 @@ describe("usage_update computation", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   it("used sums all token types as post-turn context occupancy proxy", async () => {
@@ -3069,9 +3082,12 @@ describe("emitRawSDKMessages", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   function createResultMessage() {
@@ -3297,9 +3313,12 @@ describe("result origin handling", () => {
       nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
   }
 
   function createAssistantMessage() {

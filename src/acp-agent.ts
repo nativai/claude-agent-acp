@@ -57,6 +57,7 @@ import {
   query,
   Settings,
   SDKAssistantMessageError,
+  SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
   SDKUserMessage,
@@ -153,6 +154,10 @@ type Session = {
   nextPendingOrder: number;
   abortController: AbortController;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
+  /** Resolve callback for the active prompt's current nextMessage() call. null when idle. */
+  activePromptResolve: ((msg: SDKMessage | null) => void) | null;
+  /** Error captured by the background reader loop, to be re-thrown by the prompt. */
+  backgroundLoopError: Error | null;
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Defaults to
@@ -245,6 +250,15 @@ type GatewayAuthMeta = {
 type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
 
 /**
+ * Subagent info cached when a teammate is spawned (keyed by parent tool use ID).
+ */
+type SubagentInfo = {
+  agentId: string;
+  name: string;
+  color?: string;
+};
+
+/**
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
@@ -253,6 +267,18 @@ export type ToolUpdateMeta = {
     toolName: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
+    /* Status tag, e.g. 'teammate_spawned' when a subagent is launched. */
+    status?: string;
+    /* The parent tool use ID when this message originated from a subagent. */
+    parentToolUseId?: string;
+    /* Subagent identifier, e.g. 'poet-a@haiku-demo'. */
+    subagentId?: string;
+    /* Subagent display name, e.g. 'poet-a'. */
+    subagentName?: string;
+    /* Subagent color, e.g. 'blue'. */
+    subagentColor?: string;
+    /* Last tool name used by the subagent, from task_progress. */
+    taskLastToolName?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -489,6 +515,8 @@ export class ClaudeAcpAgent implements Agent {
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
+  /** Maps parent tool use ID → subagent info for spawned teammates. */
+  subagentCache: Map<string, SubagentInfo> = new Map();
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
@@ -777,11 +805,21 @@ export class ClaudeAcpAgent implements Agent {
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
 
+    /** Waits for the background reader loop to deliver the next SDK message. */
+    const nextMessage = (): Promise<SDKMessage | null> =>
+      new Promise((resolve) => {
+        session.activePromptResolve = resolve;
+      });
+
     try {
       while (true) {
-        const { value: message, done } = await session.query.next();
+        const message = await nextMessage();
 
-        if (done || !message) {
+        if (!message) {
+          // Background loop signalled done or errored.
+          if (session.backgroundLoopError) {
+            throw session.backgroundLoopError;
+          }
           if (session.cancelled) {
             return { stopReason: "cancelled" };
           }
@@ -862,13 +900,39 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 break;
               }
+              case "task_started": {
+                if (message.tool_use_id) {
+                  await this.onTeammateSpawned(
+                    message.tool_use_id,
+                    message.task_id,
+                    message.description,
+                    params.sessionId,
+                  );
+                }
+                break;
+              }
+              case "task_progress": {
+                await this.onTaskProgress(
+                  message.tool_use_id,
+                  message.task_id,
+                  message.last_tool_name,
+                  params.sessionId,
+                );
+                break;
+              }
+              case "task_notification": {
+                await this.onTaskNotification(
+                  message.tool_use_id,
+                  message.task_id,
+                  message.status,
+                  params.sessionId,
+                );
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
-              case "task_progress":
               case "task_updated":
               case "elicitation_complete":
               case "plugin_install":
@@ -1068,6 +1132,7 @@ export class ClaudeAcpAgent implements Agent {
                 clientCapabilities: this.clientCapabilities,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                subagentCache: this.subagentCache,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1201,6 +1266,7 @@ export class ClaudeAcpAgent implements Agent {
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                subagentCache: this.subagentCache,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1242,6 +1308,10 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw error;
     } finally {
+      // Always clear the resolve callback so the background loop switches to
+      // idle mode (forwarding inter-turn activity) when this prompt exits.
+      session.activePromptResolve = null;
+
       if (!handedOff) {
         session.promptRunning = false;
         // This usually should not happen, but in case the loop finishes
@@ -2144,10 +2214,14 @@ export class ClaudeAcpAgent implements Agent {
       nextPendingOrder: 0,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
     };
+
+    this.startBackgroundReaderLoop(sessionId);
 
     return {
       sessionId,
@@ -2155,6 +2229,251 @@ export class ClaudeAcpAgent implements Agent {
       modes,
       configOptions,
     };
+  }
+
+  /**
+   * Persistent background reader loop: the sole consumer of session.query.
+   * Routes each message to the active prompt handler (if one is running) or
+   * processes it as an idle inter-turn update (subagent activity after end_turn).
+   */
+  private startBackgroundReaderLoop(sessionId: string): void {
+    const loop = async () => {
+      const session = this.sessions[sessionId];
+      if (!session) return;
+
+      try {
+        while (true) {
+          const { value, done } = await session.query.next();
+
+          if (done || !value) {
+            // Session ended — wake any waiting prompt so it can return/throw.
+            if (session.activePromptResolve) {
+              const resolve = session.activePromptResolve;
+              session.activePromptResolve = null;
+              resolve(null);
+            }
+            break;
+          }
+
+          if (session.activePromptResolve) {
+            // Deliver to the active prompt's nextMessage() call.
+            const resolve = session.activePromptResolve;
+            session.activePromptResolve = null;
+            resolve(value);
+          } else {
+            // Idle: emit raw SDK message if configured, then forward.
+            if (
+              session.emitRawSDKMessages &&
+              shouldEmitRawMessage(session.emitRawSDKMessages, value)
+            ) {
+              await this.client.extNotification("_claude/sdkMessage", {
+                sessionId,
+                message: value as Record<string, unknown>,
+              });
+            }
+            await this.handleIdleMessage(value, sessionId);
+          }
+        }
+      } catch (error) {
+        // Claude process died — store error so the prompt can re-throw it.
+        session.backgroundLoopError =
+          error instanceof Error ? error : new Error(String(error));
+        if (session.activePromptResolve) {
+          const resolve = session.activePromptResolve;
+          session.activePromptResolve = null;
+          resolve(null);
+        }
+      }
+    };
+
+    loop(); // fire and forget; errors are handled internally
+  }
+
+  /**
+   * Handle a message that arrives while no prompt is active (idle inter-turn).
+   * Forwards stream_event, assistant, and result messages as session/update
+   * notifications so ACPX can observe teammate-triggered main-agent activity.
+   */
+  private async handleIdleMessage(message: SDKMessage, sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+
+    switch (message.type) {
+      case "stream_event": {
+        for (const notification of streamEventToAcpNotifications(
+          message,
+          sessionId,
+          this.toolUseCache,
+          this.client,
+          this.logger,
+          {
+            clientCapabilities: this.clientCapabilities,
+            cwd: session.cwd,
+            taskState: session.taskState,
+            subagentCache: this.subagentCache,
+          },
+        )) {
+          await this.client.sessionUpdate(notification);
+        }
+        break;
+      }
+      case "assistant": {
+        const content = message.message.content.filter(
+          (item: any) => !["text", "thinking"].includes(item.type),
+        );
+        for (const notification of toAcpNotifications(
+          content,
+          message.message.role,
+          sessionId,
+          this.toolUseCache,
+          this.client,
+          this.logger,
+          {
+            clientCapabilities: this.clientCapabilities,
+            parentToolUseId: message.parent_tool_use_id,
+            cwd: session.cwd,
+            taskState: session.taskState,
+            subagentCache: this.subagentCache,
+          },
+        )) {
+          await this.client.sessionUpdate(notification);
+        }
+        break;
+      }
+      case "result": {
+        // Accumulate usage from idle teammate turns.
+        session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+        session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+        session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+        session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+        break;
+      }
+      case "system": {
+        if (message.subtype === "task_started" && message.tool_use_id) {
+          await this.onTeammateSpawned(
+            message.tool_use_id,
+            message.task_id,
+            message.description,
+            sessionId,
+          );
+        } else if (message.subtype === "task_progress") {
+          await this.onTaskProgress(
+            message.tool_use_id,
+            message.task_id,
+            message.last_tool_name,
+            sessionId,
+          );
+        } else if (message.subtype === "task_notification") {
+          await this.onTaskNotification(
+            message.tool_use_id,
+            message.task_id,
+            message.status,
+            sessionId,
+          );
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Called when a task_progress system message arrives.
+   * Emits a tool_call_update with status 'task_progress' so ACPX can observe subagent activity.
+   */
+  private async onTaskProgress(
+    toolUseId: string | undefined,
+    taskId: string,
+    lastToolName: string | undefined,
+    sessionId: string,
+  ): Promise<void> {
+    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        _meta: {
+          claudeCode: {
+            toolName: "Agent",
+            status: "task_progress",
+            subagentId: subagent?.agentId ?? taskId,
+            subagentName: subagent?.name,
+            subagentColor: subagent?.color,
+            taskLastToolName: lastToolName,
+          },
+        } satisfies ToolUpdateMeta,
+        toolCallId: toolUseId ?? taskId,
+        sessionUpdate: "tool_call_update",
+      },
+    });
+  }
+
+  /**
+   * Called when a task_notification system message arrives (task completed/failed/stopped).
+   * Emits a tool_call_update with status 'task_completed', 'task_failed', or 'task_stopped'.
+   */
+  private async onTaskNotification(
+    toolUseId: string | undefined,
+    taskId: string,
+    status: "completed" | "failed" | "stopped",
+    sessionId: string,
+  ): Promise<void> {
+    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        _meta: {
+          claudeCode: {
+            toolName: "Agent",
+            status: `task_${status}`,
+            subagentId: subagent?.agentId ?? taskId,
+            subagentName: subagent?.name,
+            subagentColor: subagent?.color,
+          },
+        } satisfies ToolUpdateMeta,
+        toolCallId: toolUseId ?? taskId,
+        sessionUpdate: "tool_call_update",
+      },
+    });
+  }
+
+  /**
+   * Called when a task_started system message arrives (in active prompt or idle).
+   * Populates subagentCache and emits a tool_call_update with status 'teammate_spawned'.
+   */
+  private async onTeammateSpawned(
+    toolUseId: string,
+    taskId: string,
+    description: string,
+    sessionId: string,
+  ): Promise<void> {
+    const toolUse = this.toolUseCache[toolUseId];
+    if (!toolUse || (toolUse.name !== "Agent" && toolUse.name !== "Task")) return;
+
+    const input = toolUse.input as { name?: string; description?: string; color?: string };
+    const agentName = (input.name || input.description || description).trim();
+    this.subagentCache.set(toolUseId, {
+      agentId: taskId,
+      name: agentName,
+      color: input.color,
+    });
+
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        _meta: {
+          claudeCode: {
+            toolName: toolUse.name,
+            status: "teammate_spawned",
+            subagentId: taskId,
+            subagentName: agentName,
+            subagentColor: input.color,
+          },
+        } satisfies ToolUpdateMeta,
+        toolCallId: toolUseId,
+        sessionUpdate: "tool_call_update",
+      },
+    });
   }
 }
 
@@ -2707,6 +3026,7 @@ export function toAcpNotifications(
     parentToolUseId?: string | null;
     cwd?: string;
     taskState?: TaskState;
+    subagentCache?: Map<string, SubagentInfo>;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -2722,11 +3042,19 @@ export function toAcpNotifications(
     };
 
     if (options?.parentToolUseId) {
+      const subagent = options.subagentCache?.get(options.parentToolUseId);
       update._meta = {
         ...update._meta,
         claudeCode: {
           ...(update._meta?.claudeCode || {}),
           parentToolUseId: options.parentToolUseId,
+          ...(subagent
+            ? {
+                subagentId: subagent.agentId,
+                subagentName: subagent.name,
+                ...(subagent.color !== undefined ? { subagentColor: subagent.color } : {}),
+              }
+            : {}),
         },
       };
     }
@@ -2944,7 +3272,20 @@ export function toAcpNotifications(
                 _meta: {
                   terminal_output: toolMeta.terminal_output,
                   ...(options?.parentToolUseId
-                    ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
+                    ? {
+                        claudeCode: {
+                          parentToolUseId: options.parentToolUseId,
+                          ...(options.subagentCache?.get(options.parentToolUseId)
+                            ? {
+                                subagentId: options.subagentCache.get(options.parentToolUseId)!.agentId,
+                                subagentName: options.subagentCache.get(options.parentToolUseId)!.name,
+                                ...(options.subagentCache.get(options.parentToolUseId)!.color !== undefined
+                                  ? { subagentColor: options.subagentCache.get(options.parentToolUseId)!.color }
+                                  : {}),
+                              }
+                            : {}),
+                        },
+                      }
                     : {}),
                 },
                 toolCallId: chunk.tool_use_id,
@@ -2988,11 +3329,19 @@ export function toAcpNotifications(
     }
     if (update) {
       if (options?.parentToolUseId) {
+        const subagent = options.subagentCache?.get(options.parentToolUseId);
         update._meta = {
           ...update._meta,
           claudeCode: {
             ...(update._meta?.claudeCode || {}),
             parentToolUseId: options.parentToolUseId,
+            ...(subagent
+              ? {
+                  subagentId: subagent.agentId,
+                  subagentName: subagent.name,
+                  ...(subagent.color !== undefined ? { subagentColor: subagent.color } : {}),
+                }
+              : {}),
           },
         };
       }
@@ -3013,6 +3362,7 @@ export function streamEventToAcpNotifications(
     clientCapabilities?: ClientCapabilities;
     cwd?: string;
     taskState?: TaskState;
+    subagentCache?: Map<string, SubagentInfo>;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -3030,6 +3380,7 @@ export function streamEventToAcpNotifications(
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          subagentCache: options?.subagentCache,
         },
       );
     case "content_block_delta":
@@ -3045,6 +3396,7 @@ export function streamEventToAcpNotifications(
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          subagentCache: options?.subagentCache,
         },
       );
     // No content
