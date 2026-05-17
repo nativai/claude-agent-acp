@@ -3307,6 +3307,29 @@ export function toAcpNotifications(
             rawOutput: chunk.content,
             ...toolUpdate,
           };
+
+          // Signal to the queue owner that this session has scheduled future
+          // activity so it can disable its idle TTL and keep the process tree
+          // alive until the scheduled wakeup fires.
+          const isSchedulingTool =
+            toolUse.name === "ScheduleWakeup" ||
+            toolUse.name === "CronCreate" ||
+            toolUse.name === "RemoteTrigger";
+          const isToolError = "is_error" in chunk && chunk.is_error;
+          if (isSchedulingTool && !isToolError) {
+            output.push({
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call_update" as const,
+                toolCallId: chunk.tool_use_id,
+                _meta: {
+                  claudeCode: {
+                    hasScheduledWakeup: true,
+                  },
+                },
+              },
+            });
+          }
         }
         break;
       }
