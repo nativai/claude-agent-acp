@@ -135,6 +135,14 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 
+// Coalescing bounds for the thinking-token progress signal. The SDK emits a
+// `thinking_tokens` system message per stream frame during the (often
+// redacted) thinking phase; forwarding each one would flood the client. We
+// emit at most one `_meta` update per THINKING_TOKENS_THROTTLE_MS, or sooner
+// if the running estimate jumped by at least THINKING_TOKENS_MIN_DELTA tokens.
+const THINKING_TOKENS_THROTTLE_MS = 400;
+const THINKING_TOKENS_MIN_DELTA = 64;
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -805,6 +813,11 @@ export class ClaudeAcpAgent implements Agent {
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
 
+    // Per-turn throttle state for the thinking-token progress signal (consumed
+    // by the `thinking_tokens` case below). Reset implicitly each prompt.
+    let lastThinkingTokensAt = 0;
+    let lastThinkingTokensValue = -1;
+
     /** Waits for the background reader loop to deliver the next SDK message. */
     const nextMessage = (): Promise<SDKMessage | null> =>
       new Promise((resolve) => {
@@ -943,15 +956,36 @@ export class ClaudeAcpAgent implements Agent {
               case "permission_denied":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
-              case "thinking_tokens":
+              case "thinking_tokens": {
                 // A running token-count *estimate* the SDK digests from thinking
-                // pings during the redacted-thinking phase — `estimated_tokens`,
-                // not thinking text (the redacted phase has no plaintext to
-                // forward). It also fires per stream frame, so mapping it to a
-                // thought chunk would flood the client with empty updates.
-                // Non-redacted thinking text still reaches the client via the
-                // stream_event `thinking_delta` path (see toAcpNotifications).
+                // pings (`estimated_tokens`) — not thinking text. On redacted-
+                // thinking models (e.g. opus) it is the *only* progress signal:
+                // the engine streams a signed thinking block but no plaintext.
+                // Forward it as a throttled `_meta` hint (NOT thought text, and
+                // coalesced because it fires per stream frame) so clients can
+                // render a "thinking… ~N tokens" indicator. Non-redacted thinking
+                // text still flows via the stream_event `thinking_delta` path
+                // (see toAcpNotifications).
+                const estimated = message.estimated_tokens;
+                const now = Date.now();
+                if (
+                  estimated > lastThinkingTokensValue &&
+                  (now - lastThinkingTokensAt >= THINKING_TOKENS_THROTTLE_MS ||
+                    estimated - lastThinkingTokensValue >= THINKING_TOKENS_MIN_DELTA)
+                ) {
+                  lastThinkingTokensAt = now;
+                  lastThinkingTokensValue = estimated;
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_thought_chunk",
+                      content: { type: "text", text: "" },
+                      _meta: { claudeCode: { thinkingTokens: estimated } },
+                    },
+                  });
+                }
                 break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
