@@ -943,6 +943,15 @@ export class ClaudeAcpAgent implements Agent {
               case "permission_denied":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "thinking_tokens":
+                // A running token-count *estimate* the SDK digests from thinking
+                // pings during the redacted-thinking phase — `estimated_tokens`,
+                // not thinking text (the redacted phase has no plaintext to
+                // forward). It also fires per stream frame, so mapping it to a
+                // thought chunk would flood the client with empty updates.
+                // Non-redacted thinking text still reaches the client via the
+                // stream_event `thinking_delta` path (see toAcpNotifications).
+                break;
               default:
                 unreachable(message, this.logger);
                 break;
