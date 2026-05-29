@@ -15,7 +15,10 @@ const mockQuery = vi.hoisted(() =>
   })),
 );
 
-vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
+  ...(await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+    "@anthropic-ai/claude-agent-sdk",
+  )),
   query: mockQuery,
 }));
 
@@ -117,7 +120,7 @@ describe("authorization", () => {
       expect.objectContaining({
         options: expect.objectContaining({
           env: expect.objectContaining({
-            ANTHROPIC_AUTH_TOKEN: "",
+            ANTHROPIC_AUTH_TOKEN: " ",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
             userEnv: "userEnv",
