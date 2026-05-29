@@ -3831,6 +3831,7 @@ describe("post-error recovery", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
     };
+    (agent as any).startBackgroundReaderLoop("test-session");
     return { interrupt };
   }
 

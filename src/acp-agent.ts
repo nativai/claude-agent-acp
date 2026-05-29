@@ -1414,19 +1414,6 @@ export class ClaudeAcpAgent implements Agent {
       // Bounded so a misbehaving SDK can't hang the next prompt indefinitely.
       try {
         await session.query.interrupt();
-        const MAX_DRAIN = 100;
-        for (let i = 0; i < MAX_DRAIN; i++) {
-          const { value: m, done } = await session.query.next();
-          if (done || !m) break;
-          if (m.type === "system" && m.subtype === "session_state_changed" && m.state === "idle") {
-            break;
-          }
-          if (i === MAX_DRAIN - 1) {
-            this.logger.error(
-              `Session ${params.sessionId}: drained ${MAX_DRAIN} messages after error without observing idle`,
-            );
-          }
-        }
       } catch (drainErr) {
         this.logger.error(
           `Session ${params.sessionId}: failed to drain query after prompt error:`,
