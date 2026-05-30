@@ -644,7 +644,7 @@ describe("ClaudeAcpAgent settings", () => {
     });
   });
 
-  it("resolves model aliases like opus[1m] to the correct model", async () => {
+  it("resolves model aliases like opus[1m] and advertises them under the configured alias", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
       JSON.stringify({
@@ -656,6 +656,10 @@ describe("ClaudeAcpAgent settings", () => {
     await fs.promises.mkdir(projectDir, { recursive: true });
 
     const setModelSpy = vi.fn();
+    // This SDK model list is "resume-shaped": it surfaces only resolved
+    // concrete ids (no "opus[1m]" alias entry), exactly as the SDK does when
+    // an on-disk session has the model pinned. The user configured the alias
+    // "opus[1m]".
     querySpy.mockImplementation(({ options: _options }: any) => {
       return {
         initializationResult: async () => ({
@@ -686,8 +690,73 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
+    // The SDK is still driven to the resolved concrete id...
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
-    expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+    // ...but what we ADVERTISE stays the configured alias, so a generic ACP
+    // client that persisted "opus[1m]" can re-assert it across reconnects.
+    expect(response.models.currentModelId).toBe("opus[1m]");
+    const advertisedIds = response.models.availableModels.map((m: any) => m.modelId);
+    expect(advertisedIds).toContain("opus[1m]");
+    expect(advertisedIds).not.toContain("claude-opus-4-6-1m");
+  });
+
+  it("keeps the advertised opus[1m] id stable across session/new and session/resume (Bug B regression)", async () => {
+    // Bug B: production acpx-ui pins the model as the alias "opus[1m]" and, on
+    // every revival after turn 1, re-asserts that persisted alias against the
+    // bridge's advertised model set using an exact-string match. On
+    // session/new the SDK surfaces the alias verbatim; on session/resume the
+    // on-disk session is pinned to the resolved concrete id, so the SDK
+    // surfaces THAT instead. If the bridge let the advertised value drift to
+    // the resolved id on resume, acpx's gate rejected the still-valid alias
+    // and the session could no longer be revived. The bridge must therefore
+    // advertise the SAME id ("opus[1m]") in both phases.
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ model: "opus[1m]" }),
+    );
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+
+    const advertisedFor = async (models: any[]): Promise<string[]> => {
+      querySpy.mockImplementation(() => ({
+        initializationResult: async () => ({ models }),
+        setModel: vi.fn(),
+        supportedCommands: async () => [],
+      }) as any);
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+      return response.models.availableModels.map((m: any) => m.modelId);
+    };
+
+    // session/new: the SDK surfaces the configured alias verbatim.
+    const newAdvertised = await advertisedFor([
+      { value: "default", displayName: "Default (recommended)", description: "" },
+      { value: "sonnet", displayName: "Sonnet", description: "" },
+      { value: "haiku", displayName: "Haiku", description: "" },
+      { value: "opus[1m]", displayName: "Opus (1M context)", description: "" },
+    ]);
+
+    // session/resume: the on-disk session is pinned, so the SDK surfaces the
+    // resolved concrete id in place of the alias.
+    const resumeAdvertised = await advertisedFor([
+      { value: "default", displayName: "Default (recommended)", description: "" },
+      { value: "sonnet", displayName: "Sonnet", description: "" },
+      { value: "sonnet[1m]", displayName: "Sonnet (1M context)", description: "" },
+      { value: "haiku", displayName: "Haiku", description: "" },
+      { value: "claude-opus-4-8[1m]", displayName: "Opus 4.8 (1M context)", description: "" },
+    ]);
+
+    // The opus model is advertised under the same stable alias in both phases,
+    // and the volatile resolved id is never advertised.
+    expect(newAdvertised).toContain("opus[1m]");
+    expect(resumeAdvertised).toContain("opus[1m]");
+    expect(resumeAdvertised).not.toContain("claude-opus-4-8[1m]");
   });
 
   it("skips the initial setModel when the resolved value matches the SDK's model list verbatim", async () => {

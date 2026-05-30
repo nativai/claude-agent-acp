@@ -2297,7 +2297,12 @@ export class ClaudeAcpAgent implements Agent {
       ? applyAvailableModelsAllowlist(initializationResult.models, settingsAvailableModels)
       : initializationResult.models;
 
-    const models = await getAvailableModels(
+    // `getAvailableModels` may re-label the user's pinned model so its
+    // advertised id stays stable across new/resume (see its docs). Use the
+    // returned `resolvedModelInfos` — not the pre-call `allowedModels` — for
+    // every downstream model lookup so the stored `modelInfos`, advertised
+    // ids, and `currentModelId` remain mutually consistent.
+    const { state: models, modelInfos: resolvedModelInfos } = await getAvailableModels(
       q,
       allowedModels,
       initializationResult.models,
@@ -2307,7 +2312,7 @@ export class ClaudeAcpAgent implements Agent {
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
-    const currentModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
+    const currentModelInfo = resolvedModelInfos.find((m) => m.value === models.currentModelId);
     const availableModes = buildAvailableModes(currentModelInfo);
 
     // Clamp `permissionMode` if the resolved session does not offer it. The
@@ -2348,7 +2353,7 @@ export class ClaudeAcpAgent implements Agent {
     const configOptions = buildConfigOptions(
       modes,
       models,
-      allowedModels,
+      resolvedModelInfos,
       settingsManager.getSettings().effortLevel,
     );
 
@@ -2379,7 +2384,7 @@ export class ClaudeAcpAgent implements Agent {
       },
       modes,
       models,
-      modelInfos: allowedModels,
+      modelInfos: resolvedModelInfos,
       configOptions,
       promptRunning: false,
       pendingMessages: new Map(),
@@ -3048,7 +3053,7 @@ async function getAvailableModels(
   sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
-): Promise<SessionModelState> {
+): Promise<{ state: SessionModelState; modelInfos: ModelInfo[] }> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -3083,20 +3088,52 @@ async function getAvailableModels(
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
   // setModel call so we don't drift from the user's intended pin.
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
-  const skipSetModel =
-    resolvedFromInput === undefined ||
-    (currentModel.value === resolvedFromInput && sdkSawSameValue);
+  const userInputWasFuzzyMatch =
+    resolvedFromInput !== undefined && currentModel.value !== resolvedFromInput;
+  const skipSetModel = resolvedFromInput === undefined || (!userInputWasFuzzyMatch && sdkSawSameValue);
   if (!skipSetModel) {
     await query.setModel(currentModel.value);
   }
 
+  // Keep the advertised model id STABLE for the user's pinned model across
+  // session/new and session/resume. On session/new the SDK surfaces the
+  // user's configured alias verbatim as a model value (e.g. "opus[1m]"), but
+  // on session/resume the on-disk Claude Code session is pinned to the
+  // resolved concrete id, so the SDK surfaces that instead (e.g.
+  // "claude-opus-4-8[1m]"). A generic ACP client (acpx) persists the alias it
+  // first saw and re-asserts it against the advertised set on every reconnect
+  // via an exact-string match; if we let the advertised value drift to the
+  // resolved id on resume, that gate rejects the still-valid alias and the
+  // session can no longer be revived. So when the user's configured input
+  // fuzzily resolved to a different concrete id, re-label that one resolved
+  // entry under the alias the user/SDK uses on new. `setModel` above already
+  // received the resolved `currentModel.value`, so this only affects what we
+  // advertise — not what the SDK runs. The relabeled list is returned as
+  // `modelInfos` so downstream consumers (configOptions, effort gating,
+  // setModel lookups) stay consistent with the advertised ids. Robust across
+  // future model bumps: "opus[1m]" keeps working when the resolved id changes.
+  let advertisedModels = models;
+  let advertisedCurrentId = currentModel.value;
+  if (userInputWasFuzzyMatch && resolvedFromInput) {
+    const aliasAlreadyAdvertised = models.some((m) => m.value === resolvedFromInput);
+    if (!aliasAlreadyAdvertised) {
+      advertisedModels = models.map((model) =>
+        model.value === currentModel.value ? { ...model, value: resolvedFromInput } : model,
+      );
+      advertisedCurrentId = resolvedFromInput;
+    }
+  }
+
   return {
-    availableModels: models.map((model) => ({
-      modelId: model.value,
-      name: model.displayName,
-      description: model.description,
-    })),
-    currentModelId: currentModel.value,
+    state: {
+      availableModels: advertisedModels.map((model) => ({
+        modelId: model.value,
+        name: model.displayName,
+        description: model.description,
+      })),
+      currentModelId: advertisedCurrentId,
+    },
+    modelInfos: advertisedModels,
   };
 }
 
