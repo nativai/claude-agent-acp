@@ -146,6 +146,53 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
 const THINKING_TOKENS_THROTTLE_MS = 400;
 const THINKING_TOKENS_MIN_DELTA = 64;
 
+/**
+ * Reliability surfacing constants — SHARED CONTRACT with the acpx-ui server and
+ * the acpx CLI (conception §0). Keep these values in lockstep across the three
+ * repos; they are intentionally named so a single edit retunes them.
+ *
+ *   RESUME_HEARTBEAT_MS  cadence of init/resume "still resuming — N s" heartbeats.
+ *   INIT_HARD_MS         hard ceiling on init/resume; past this we throw a
+ *                        structured terminal error instead of hanging forever.
+ *   WEDGE_DISPLAY_MS     turn no-activity surfacing threshold ("no activity for N s").
+ *
+ * These make the silent hang VISIBLE; they are NOT a cure. A natively-blocked
+ * child makes the SDK's `query.next()` never yield, so the guaranteed un-wedge
+ * is an EXTERNAL process force-restart (owned by acpx). See CONCEPTION §3, §4.3,
+ * §4.6.
+ */
+export const RESUME_HEARTBEAT_MS = 5_000;
+export const INIT_HARD_MS = 300_000;
+export const WEDGE_DISPLAY_MS = 90_000;
+
+/**
+ * Opt-in, best-effort Tier-1 self-abort (CONCEPTION §4.3 Tier 1). When the env
+ * var `ACP_TURN_NOACTIVITY_ABORT_MS` is set to a positive integer, a turn with
+ * no delivered message for that many ms tears itself down (abort + close) and
+ * the prompt throws a terminal error. OFF by default: this only frees wedges the
+ * SDK can preempt — a natively-blocked child still needs the external restart.
+ */
+function turnNoActivityAbortMs(): number | null {
+  const raw = process.env.ACP_TURN_NOACTIVITY_ABORT_MS;
+  if (!raw) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Terminal reason for the last turn, forwarded to the client so the acpx-ui
+ *  server can surface it as `activity.lastTurnEndReason`. Mirrors the stop
+ *  reasons already captured by the prompt loop. */
+type LastTurnEndReason = "end_turn" | "max_tokens" | "max_turns" | "error" | "cancelled";
+
+/** ext-notification method carrying ephemeral adapter status (resume heartbeat /
+ *  turn no-activity). A side channel — NOT a `session/update` — so it advances
+ *  the client's stream (defeating staleness) without changing the stream-tail
+ *  kind the server uses to tell `resuming` from `working`. */
+export const SESSION_STATUS_NOTIFICATION = "_claude/sessionStatus";
+/** `_meta` key carrying the terminal turn reason on the final `usage_update`
+ *  `session/update` and on the `PromptResponse`. */
+export const LAST_TURN_END_REASON_META_KEY = "_claude/lastTurnEndReason";
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -826,6 +873,10 @@ export class ClaudeAcpAgent implements Agent {
     let handedOff = false;
     let errored = false;
     let stopReason: StopReason = "end_turn";
+    // Terminal reason for THIS turn, forwarded to the client (CONCEPTION §3, D3).
+    // Set when a `result` message arrives; consumed by the final `usage_update`
+    // and the `PromptResponse`.
+    let lastTurnEndReason: LastTurnEndReason | undefined;
 
     // Per-turn throttle state for the thinking-token progress signal (consumed
     // by the `thinking_tokens` case below). Reset implicitly each prompt.
@@ -838,9 +889,66 @@ export class ClaudeAcpAgent implements Agent {
         session.activePromptResolve = resolve;
       });
 
+    // Turn no-activity surfacing (CONCEPTION §3) + optional Tier-1 self-abort
+    // (§4.3). Reset on every delivered message; if WEDGE_DISPLAY_MS elapses with
+    // no message we emit "no activity for N s". This runs on the adapter's event
+    // loop, which stays ALIVE during a wedge (only the SDK child / query.next()
+    // is blocked), so the timer still fires. SURFACING ONLY — it does not abort
+    // the wedge unless the opt-in self-abort env var is set; the guaranteed cure
+    // is an external force-restart.
+    //
+    // ONE-SHOT per silent stretch (re-armed only when real activity resumes).
+    // CRITICAL: acpx persists every adapter notification to the session stream
+    // and bumps `event_log.last_write_at` on each write (raw tap — acpx
+    // runtime.ts onAcpMessage / queue-owner-runtime.ts). The acpx-ui server's
+    // wedge clock is `now - last_write_at`, so a RECURRING marker would reset
+    // that clock every WEDGE_DISPLAY_MS and MASK the wedge forever (never
+    // detected → watchdog never restarts). One-shot bounds any clock disturbance
+    // to a single bump. (acpx guards `_claude/sessionStatus` from the
+    // last_write_at bump as the complete cross-repo fix.)
+    let lastActivityAt = Date.now();
+    let noActivityNotified = false;
+    const selfAbortMs = turnNoActivityAbortMs();
+    const noActivityTimer = setInterval(() => {
+      const elapsedMs = Date.now() - lastActivityAt;
+      if (elapsedMs < WEDGE_DISPLAY_MS) return;
+      const seconds = Math.round(elapsedMs / 1000);
+      if (!noActivityNotified) {
+        noActivityNotified = true;
+        void this.client
+          .extNotification(SESSION_STATUS_NOTIFICATION, {
+            sessionId: params.sessionId,
+            phase: "turn_no_activity",
+            elapsedMs,
+            message: `no activity for ${seconds}s`,
+          })
+          .catch(() => {});
+      }
+      if (selfAbortMs !== null && elapsedMs >= selfAbortMs) {
+        // Best-effort Tier-1 self-abort (OFF unless ACP_TURN_NOACTIVITY_ABORT_MS
+        // is set). Stage a terminal error, then teardown (abort + close). The
+        // teardown's cancel() resolves the parked nextMessage() so the loop
+        // re-throws this error. NOT guaranteed to free a natively-blocked child.
+        this.logger.error(
+          `Session ${params.sessionId}: no activity for ${seconds}s — best-effort ` +
+            `self-abort (external restart is the guaranteed recovery).`,
+        );
+        session.backgroundLoopError ??= new Error(
+          `Turn aborted: no activity for ${seconds}s. Best-effort self-abort; if the ` +
+            `agent is natively blocked, an external process restart is required.`,
+        );
+        clearInterval(noActivityTimer);
+        void this.teardownSession(params.sessionId);
+      }
+    }, WEDGE_DISPLAY_MS);
+
     try {
       while (true) {
         const message = await nextMessage();
+        // Reset the no-activity timer: the background loop just delivered.
+        // Re-arm the one-shot so a fresh silent stretch can surface again.
+        lastActivityAt = Date.now();
+        noActivityNotified = false;
 
         if (!message) {
           // Background loop signalled done or errored.
@@ -946,7 +1054,24 @@ export class ClaudeAcpAgent implements Agent {
                   if (session.cancelled) {
                     stopReason = "cancelled";
                   }
-                  return { stopReason, usage: sessionUsage(session) };
+                  // Forward the terminal reason as a structured PromptResponse
+                  // field too (CONCEPTION §3 "and/or a structured prompt-result
+                  // field"). Falls back to mapping the final stopReason if no
+                  // result message captured it.
+                  const endReason: LastTurnEndReason =
+                    lastTurnEndReason ??
+                    (stopReason === "max_tokens"
+                      ? "max_tokens"
+                      : stopReason === "max_turn_requests"
+                        ? "max_turns"
+                        : stopReason === "cancelled"
+                          ? "cancelled"
+                          : "end_turn");
+                  return {
+                    stopReason,
+                    usage: sessionUsage(session),
+                    _meta: { [LAST_TURN_END_REASON_META_KEY]: endReason },
+                  };
                 }
                 break;
               }
@@ -1091,7 +1216,27 @@ export class ClaudeAcpAgent implements Agent {
             // slash-command output forwarding) but their cost is real.
             const isTaskNotification = message.origin?.kind === "task-notification";
 
-            // Send usage_update notification
+            // Capture the terminal turn reason (CONCEPTION §3, D3) so it can be
+            // forwarded to the client on the final usage_update and the
+            // PromptResponse. Mirrors the stop reasons the switch below derives.
+            // Task-notification followups are autonomous and never set it.
+            if (!isTaskNotification) {
+              if (message.subtype === "success" || message.subtype === "error_during_execution") {
+                lastTurnEndReason =
+                  message.stop_reason === "max_tokens"
+                    ? "max_tokens"
+                    : message.is_error
+                      ? "error"
+                      : "end_turn";
+              } else {
+                // error_max_turns | error_max_budget_usd | error_max_structured_output_retries
+                lastTurnEndReason = "max_turns";
+              }
+            }
+
+            // Send usage_update notification. Carry the terminal turn reason in
+            // `_meta` so the acpx-ui server reads it off the same `usage_update`
+            // stream-tail it already treats as the turn-end marker (§2.2).
             if (lastAssistantTotalUsage !== null) {
               await this.client.sessionUpdate({
                 sessionId: params.sessionId,
@@ -1103,8 +1248,13 @@ export class ClaudeAcpAgent implements Agent {
                     amount: message.total_cost_usd,
                     currency: "USD",
                   },
-                  ...(message.origin && {
-                    _meta: { "_claude/origin": message.origin },
+                  ...((message.origin || lastTurnEndReason) && {
+                    _meta: {
+                      ...(message.origin && { "_claude/origin": message.origin }),
+                      ...(lastTurnEndReason && {
+                        [LAST_TURN_END_REASON_META_KEY]: lastTurnEndReason,
+                      }),
+                    },
                   }),
                 },
               });
@@ -1443,6 +1593,8 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw error;
     } finally {
+      // Stop the turn no-activity timer for this prompt.
+      clearInterval(noActivityTimer);
       // Always clear the resolve callback so the background loop switches to
       // idle mode (forwarding inter-turn activity) when this prompt exits.
       session.activePromptResolve = null;
@@ -1484,6 +1636,20 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
+    // Cancel hygiene (CONCEPTION §4.6): also unblock the ACTIVE prompt loop's
+    // pending `nextMessage()` so it observes `cancelled`, returns
+    // `{stopReason:'cancelled'}`, and clears `promptRunning` in its finally.
+    // Without this the loop stays parked at `await nextMessage()` even after a
+    // cancel, so `promptRunning` never clears and newly-parked prompts keep
+    // ACCUMULATING — the wedge grows and stays undetectable. This does NOT
+    // un-wedge the SDK child: the background reader loop is still stuck at
+    // `query.next()` and `interrupt()` can't force it to yield, so the *next*
+    // prompt would re-wedge. The guaranteed cure is an external force-restart.
+    if (session.activePromptResolve) {
+      const resolve = session.activePromptResolve;
+      session.activePromptResolve = null;
+      resolve(null);
+    }
     await session.query.interrupt();
   }
 
@@ -2029,6 +2195,83 @@ export class ClaudeAcpAgent implements Agent {
     };
   }
 
+  /**
+   * Await an init/resume promise (`q.initializationResult()`) but BOUNDED
+   * (CONCEPTION §3, D2):
+   *   • emit a `_claude/sessionStatus` heartbeat every RESUME_HEARTBEAT_MS so a
+   *     long resume never looks dead and the client stream keeps advancing
+   *     (defeating staleness) — without changing the `session/update` stream-tail
+   *     kind the server uses to tell `resuming` from `working`; and
+   *   • HARD-FAIL at INIT_HARD_MS with a STRUCTURED terminal error instead of
+   *     hanging forever, aborting + closing the orphaned query so its child
+   *     process doesn't leak (the session isn't registered yet, so
+   *     teardownSession can't reach it).
+   * This SURFACES + bounds the hang; it is not the cure — a natively-blocked
+   * child is only cured by an external process force-restart.
+   */
+  private async awaitInitializationBounded<T>(
+    initPromise: Promise<T>,
+    opts: { sessionId: string; isResume: boolean; abort: () => void; close: () => void },
+  ): Promise<T> {
+    const { sessionId, isResume } = opts;
+    const startedAt = Date.now();
+    const heartbeat = setInterval(() => {
+      const elapsedMs = Date.now() - startedAt;
+      const seconds = Math.round(elapsedMs / 1000);
+      void this.client
+        .extNotification(SESSION_STATUS_NOTIFICATION, {
+          sessionId,
+          phase: isResume ? "resuming" : "initializing",
+          elapsedMs,
+          hardLimitMs: INIT_HARD_MS,
+          message: `${isResume ? "still resuming" : "still initializing"} — ${seconds}s`,
+        })
+        .catch(() => {});
+    }, RESUME_HEARTBEAT_MS);
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    try {
+      return await Promise.race([
+        initPromise,
+        new Promise<never>((_, reject) => {
+          hardTimer = setTimeout(() => {
+            timedOut = true;
+            reject(
+              RequestError.internalError(
+                {
+                  "_claude/timeout": "init",
+                  phase: isResume ? "resume" : "init",
+                  elapsedMs: INIT_HARD_MS,
+                },
+                isResume
+                  ? "Resume timed out — the session may be too large to rehydrate. " +
+                      "Try Hard recover or start a fresh session."
+                  : "Initialization timed out. Try Hard recover or start a fresh session.",
+              ),
+            );
+          }, INIT_HARD_MS);
+        }),
+      ]);
+    } catch (error) {
+      if (timedOut) {
+        try {
+          opts.abort();
+        } catch {
+          /* best-effort */
+        }
+        try {
+          opts.close();
+        } catch {
+          /* best-effort */
+        }
+      }
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+      if (hardTimer) clearTimeout(hardTimer);
+    }
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: { resume?: string; forkSession?: boolean } = {},
@@ -2261,9 +2504,17 @@ export class ClaudeAcpAgent implements Agent {
       options,
     });
 
+    // INIT/RESUME bounded timeout + heartbeat (CONCEPTION §3, D2). Never block
+    // forever on a heavy resume or a blocked child: emit "still resuming — N s"
+    // heartbeats and HARD-FAIL at INIT_HARD_MS with a structured terminal error.
     let initializationResult;
     try {
-      initializationResult = await q.initializationResult();
+      initializationResult = await this.awaitInitializationBounded(q.initializationResult(), {
+        sessionId,
+        isResume: Boolean(creationOpts.resume),
+        abort: () => abortController.abort(),
+        close: () => q.close(),
+      });
     } catch (error) {
       if (
         creationOpts.resume &&

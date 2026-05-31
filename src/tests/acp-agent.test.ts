@@ -33,6 +33,11 @@ import {
   claudeCliPath,
   describeAlwaysAllow,
   streamEventToAcpNotifications,
+  RESUME_HEARTBEAT_MS,
+  INIT_HARD_MS,
+  WEDGE_DISPLAY_MS,
+  SESSION_STATUS_NOTIFICATION,
+  LAST_TURN_END_REASON_META_KEY,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
@@ -3480,12 +3485,14 @@ describe("result origin handling", () => {
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
+    // _meta now also carries the terminal turn reason (CONCEPTION §3) alongside origin.
     expect(usageUpdate.update._meta).toEqual({
       "_claude/origin": { kind: "channel", server: "acp" },
+      "_claude/lastTurnEndReason": "end_turn",
     });
   });
 
-  it("omits _meta when origin is absent", async () => {
+  it("carries lastTurnEndReason in usage_update _meta when origin is absent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createAssistantMessage(),
@@ -3497,7 +3504,10 @@ describe("result origin handling", () => {
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
-    expect(usageUpdate.update._meta).toBeUndefined();
+    // With no origin, _meta carries only the terminal turn reason.
+    expect(usageUpdate.update._meta).toEqual({
+      "_claude/lastTurnEndReason": "end_turn",
+    });
   });
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
@@ -3936,5 +3946,409 @@ describe("streamEventToAcpNotifications", () => {
 
     expect(result).toEqual([]);
     expect(errors).toEqual([]);
+  });
+});
+
+// Step 6 (claude-agent-acp): bounded init/resume timeout + heartbeat, turn
+// no-activity surfacing, lastTurnEndReason forwarding, and cancel hygiene.
+// CONCEPTION §3, §4.3 (Tier 1), §4.6.
+describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => {
+  function createCaptureAgent() {
+    const updates: any[] = [];
+    const extNotifications: { method: string; params: any }[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+      },
+      extNotification: async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates, extNotifications };
+  }
+
+  function baseSessionRecord(query: any, input: Pushable<any>) {
+    return {
+      query,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false as boolean | SDKMessageFilter[],
+      activePromptResolve: null,
+      backgroundLoopError: null,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+  }
+
+  // A normal session that replays the user message then yields `messages`.
+  function injectMessageSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* gen() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    const query = Object.assign(gen(), { interrupt: vi.fn(), close: vi.fn() });
+    agent.sessions["test-session"] = baseSessionRecord(query, input) as any;
+    (agent as any).startBackgroundReaderLoop("test-session");
+    return agent.sessions["test-session"]!;
+  }
+
+  // A WEDGED session: replays the user message, then `query.next()` never
+  // yields again (the incident's hard wedge — the adapter event loop stays
+  // alive, only the SDK child is blocked).
+  function injectWedgeSession(agent: ClaudeAcpAgent) {
+    const input = new Pushable<any>();
+    async function* gen() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      await new Promise(() => {}); // never yields again
+    }
+    const query = Object.assign(gen(), { interrupt: vi.fn(), close: vi.fn() });
+    agent.sessions["test-session"] = baseSessionRecord(query, input) as any;
+    (agent as any).startBackgroundReaderLoop("test-session");
+    return agent.sessions["test-session"]!;
+  }
+
+  function createAssistant() {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "hi" }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    };
+  }
+
+  function createResult(overrides: Record<string, unknown> = {}) {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...overrides,
+    };
+  }
+
+  async function waitFor(pred: () => boolean, timeoutMs = 1000) {
+    const start = Date.now();
+    while (!pred()) {
+      if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  }
+
+  // ---- (c) lastTurnEndReason forwarding -----------------------------------
+
+  it("(c) forwards max_tokens as lastTurnEndReason on usage_update _meta and PromptResponse _meta", async () => {
+    const { agent, updates } = createCaptureAgent();
+    injectMessageSession(agent, [
+      createAssistant(),
+      createResult({ stop_reason: "max_tokens" }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "x" }],
+    });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_tokens");
+    expect(response.stopReason).toBe("max_tokens");
+    expect((response as any)._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_tokens");
+  });
+
+  it("(c) forwards end_turn for a normal turn", async () => {
+    const { agent, updates } = createCaptureAgent();
+    injectMessageSession(agent, [
+      createAssistant(),
+      createResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "x" }],
+    });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("end_turn");
+    expect((response as any)._meta[LAST_TURN_END_REASON_META_KEY]).toBe("end_turn");
+  });
+
+  it("(c) forwards max_turns for an error_max_turns result", async () => {
+    const { agent, updates } = createCaptureAgent();
+    injectMessageSession(agent, [
+      createAssistant(),
+      createResult({ subtype: "error_max_turns", is_error: false, stop_reason: null }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "x" }],
+    });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_turns");
+    expect(response.stopReason).toBe("max_turn_requests");
+    expect((response as any)._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_turns");
+  });
+
+  it("(c) forwards error on the usage_update _meta when the turn errors", async () => {
+    const { agent, updates } = createCaptureAgent();
+    injectMessageSession(agent, [
+      createAssistant(),
+      createResult({ is_error: true, result: "boom" }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "x" }] }),
+    ).rejects.toBeDefined();
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("error");
+  });
+
+  it("(c) does NOT set lastTurnEndReason for a task-notification result", async () => {
+    const { agent, updates } = createCaptureAgent();
+    injectMessageSession(agent, [
+      createAssistant(),
+      createResult({ origin: { kind: "task-notification" } }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "x" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate.update._meta?.[LAST_TURN_END_REASON_META_KEY]).toBeUndefined();
+  });
+
+  // ---- (d) cancel hygiene (§4.6) ------------------------------------------
+
+  it("(d) cancel unblocks a parked active prompt and clears promptRunning", async () => {
+    const { agent } = createCaptureAgent();
+    const session = injectWedgeSession(agent);
+
+    const promptP = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "x" }],
+    });
+
+    // Wait until the prompt loop is parked at nextMessage() (wedged).
+    await waitFor(() => session.promptRunning === true && session.activePromptResolve !== null);
+    expect(session.promptRunning).toBe(true);
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const response = await promptP;
+    expect(response.stopReason).toBe("cancelled");
+    expect(session.promptRunning).toBe(false);
+    expect(session.query.interrupt).toHaveBeenCalled();
+  });
+
+  // ---- (a) bounded init/resume: heartbeat + hard-fail ---------------------
+
+  it("(a) emits resume heartbeats and HARD-FAILS at INIT_HARD_MS with a structured error", async () => {
+    vi.useFakeTimers();
+    try {
+      const { agent, extNotifications } = createCaptureAgent();
+      const abort = vi.fn();
+      const close = vi.fn();
+      // An init promise that never resolves on its own.
+      const neverResolves = new Promise<{ ok: true }>(() => {});
+      const settled = (agent as any)
+        .awaitInitializationBounded(neverResolves, {
+          sessionId: "s1",
+          isResume: true,
+          abort,
+          close,
+        })
+        .then(
+          (v: unknown) => ({ value: v }),
+          (e: any) => ({ error: e }),
+        );
+
+      // First heartbeat lands by RESUME_HEARTBEAT_MS.
+      await vi.advanceTimersByTimeAsync(RESUME_HEARTBEAT_MS + 10);
+      const beats = extNotifications.filter(
+        (n) => n.method === SESSION_STATUS_NOTIFICATION && n.params.phase === "resuming",
+      );
+      expect(beats.length).toBeGreaterThanOrEqual(1);
+      expect(beats[0].params.message).toMatch(/still resuming/);
+      expect(beats[0].params.hardLimitMs).toBe(INIT_HARD_MS);
+
+      // Advance to the hard ceiling → structured terminal error.
+      await vi.advanceTimersByTimeAsync(INIT_HARD_MS);
+      const result: any = await settled;
+      expect(result.error).toBeDefined();
+      expect(String(result.error.message)).toMatch(/Resume timed out/);
+      expect(result.error.data?.["_claude/timeout"]).toBe("init");
+      expect(result.error.data?.phase).toBe("resume");
+      // Orphaned query is cleaned up so the child process doesn't leak.
+      expect(abort).toHaveBeenCalled();
+      expect(close).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("(a) resolves normally and emits no hard-fail when init completes in time", async () => {
+    vi.useFakeTimers();
+    try {
+      const { agent, extNotifications } = createCaptureAgent();
+      const initResult = await (agent as any).awaitInitializationBounded(
+        Promise.resolve({ ok: true }),
+        { sessionId: "s1", isResume: false, abort: vi.fn(), close: vi.fn() },
+      );
+      expect(initResult).toEqual({ ok: true });
+      // No heartbeats yet (resolved before the first 5s tick).
+      expect(extNotifications.filter((n) => n.method === SESSION_STATUS_NOTIFICATION)).toHaveLength(
+        0,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ---- (b) turn no-activity surfacing (surfacing only) --------------------
+
+  it("(b) surfaces turn no-activity ONCE per silent stretch without aborting", async () => {
+    vi.useFakeTimers();
+    try {
+      const { agent, extNotifications } = createCaptureAgent();
+      const session = injectWedgeSession(agent);
+
+      const promptP = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "x" }],
+      });
+      // Avoid an unhandled rejection if anything throws; we cancel at the end.
+      promptP.catch(() => {});
+
+      // Drive the fake clock WELL PAST the threshold (3+ intervals). The adapter
+      // event loop is alive during a wedge, so the interval keeps ticking — but
+      // the notification must be ONE-SHOT (recurring would reset the server's
+      // last_write_at wedge clock and mask the wedge forever).
+      await vi.advanceTimersByTimeAsync(WEDGE_DISPLAY_MS * 3 + 100);
+
+      const noActivity = extNotifications.filter(
+        (n) => n.method === SESSION_STATUS_NOTIFICATION && n.params.phase === "turn_no_activity",
+      );
+      expect(noActivity).toHaveLength(1); // one-shot, NOT recurring
+      expect(noActivity[0].params.message).toMatch(/no activity for/);
+      // SURFACING ONLY: the turn is NOT aborted; promptRunning stays true.
+      expect(session.promptRunning).toBe(true);
+
+      // Clean up: cancel unblocks the parked prompt (cancel hygiene).
+      await agent.cancel({ sessionId: "test-session" });
+      await vi.advanceTimersByTimeAsync(0);
+      await promptP;
+      expect(session.promptRunning).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ---- (e) optional, opt-in Tier-1 self-abort -----------------------------
+
+  it("(e) self-aborts a wedged turn only when ACP_TURN_NOACTIVITY_ABORT_MS is set", async () => {
+    vi.useFakeTimers();
+    const prev = process.env.ACP_TURN_NOACTIVITY_ABORT_MS;
+    process.env.ACP_TURN_NOACTIVITY_ABORT_MS = String(WEDGE_DISPLAY_MS);
+    try {
+      const { agent } = createCaptureAgent();
+      const session = injectWedgeSession(agent);
+      const abortController = session.abortController;
+
+      const promptP = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "x" }],
+      });
+      const settled = promptP.then(
+        (v) => ({ value: v }),
+        (e: any) => ({ error: e }),
+      );
+
+      await vi.advanceTimersByTimeAsync(WEDGE_DISPLAY_MS + 100);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const result: any = await settled;
+      expect(result.error).toBeDefined();
+      expect(String(result.error.message)).toMatch(/no activity/);
+      // teardownSession ran: session removed + aborted + query closed.
+      expect(agent.sessions["test-session"]).toBeUndefined();
+      expect(abortController.signal.aborted).toBe(true);
+      expect(session.query.close).toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.ACP_TURN_NOACTIVITY_ABORT_MS;
+      else process.env.ACP_TURN_NOACTIVITY_ABORT_MS = prev;
+      vi.useRealTimers();
+    }
   });
 });
