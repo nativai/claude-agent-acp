@@ -3779,7 +3779,7 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
 
   // ---- (b) turn no-activity surfacing (surfacing only) --------------------
 
-  it("(b) surfaces turn no-activity after WEDGE_DISPLAY_MS without aborting", async () => {
+  it("(b) surfaces turn no-activity ONCE per silent stretch without aborting", async () => {
     vi.useFakeTimers();
     try {
       const { agent, extNotifications } = createCaptureAgent();
@@ -3792,14 +3792,16 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
       // Avoid an unhandled rejection if anything throws; we cancel at the end.
       promptP.catch(() => {});
 
-      // Drive the fake clock past the no-activity threshold; the adapter event
-      // loop is alive during a wedge, so the interval still fires.
-      await vi.advanceTimersByTimeAsync(WEDGE_DISPLAY_MS + 100);
+      // Drive the fake clock WELL PAST the threshold (3+ intervals). The adapter
+      // event loop is alive during a wedge, so the interval keeps ticking — but
+      // the notification must be ONE-SHOT (recurring would reset the server's
+      // last_write_at wedge clock and mask the wedge forever).
+      await vi.advanceTimersByTimeAsync(WEDGE_DISPLAY_MS * 3 + 100);
 
       const noActivity = extNotifications.filter(
         (n) => n.method === SESSION_STATUS_NOTIFICATION && n.params.phase === "turn_no_activity",
       );
-      expect(noActivity.length).toBeGreaterThanOrEqual(1);
+      expect(noActivity).toHaveLength(1); // one-shot, NOT recurring
       expect(noActivity[0].params.message).toMatch(/no activity for/);
       // SURFACING ONLY: the turn is NOT aborted; promptRunning stays true.
       expect(session.promptRunning).toBe(true);

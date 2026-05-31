@@ -869,20 +869,34 @@ export class ClaudeAcpAgent implements Agent {
     // is blocked), so the timer still fires. SURFACING ONLY — it does not abort
     // the wedge unless the opt-in self-abort env var is set; the guaranteed cure
     // is an external force-restart.
+    //
+    // ONE-SHOT per silent stretch (re-armed only when real activity resumes).
+    // CRITICAL: acpx persists every adapter notification to the session stream
+    // and bumps `event_log.last_write_at` on each write (raw tap — acpx
+    // runtime.ts onAcpMessage / queue-owner-runtime.ts). The acpx-ui server's
+    // wedge clock is `now - last_write_at`, so a RECURRING marker would reset
+    // that clock every WEDGE_DISPLAY_MS and MASK the wedge forever (never
+    // detected → watchdog never restarts). One-shot bounds any clock disturbance
+    // to a single bump. (Full fix: acpx should not bump last_write_at for
+    // `_claude/*` markers — tracked cross-repo.)
     let lastActivityAt = Date.now();
+    let noActivityNotified = false;
     const selfAbortMs = turnNoActivityAbortMs();
     const noActivityTimer = setInterval(() => {
       const elapsedMs = Date.now() - lastActivityAt;
       if (elapsedMs < WEDGE_DISPLAY_MS) return;
       const seconds = Math.round(elapsedMs / 1000);
-      void this.client
-        .extNotification(SESSION_STATUS_NOTIFICATION, {
-          sessionId: params.sessionId,
-          phase: "turn_no_activity",
-          elapsedMs,
-          message: `no activity for ${seconds}s`,
-        })
-        .catch(() => {});
+      if (!noActivityNotified) {
+        noActivityNotified = true;
+        void this.client
+          .extNotification(SESSION_STATUS_NOTIFICATION, {
+            sessionId: params.sessionId,
+            phase: "turn_no_activity",
+            elapsedMs,
+            message: `no activity for ${seconds}s`,
+          })
+          .catch(() => {});
+      }
       if (selfAbortMs !== null && elapsedMs >= selfAbortMs) {
         // Best-effort Tier-1 self-abort (OFF unless ACP_TURN_NOACTIVITY_ABORT_MS
         // is set). Stage a terminal error, then teardown (abort + close). The
@@ -905,7 +919,9 @@ export class ClaudeAcpAgent implements Agent {
       while (true) {
         const message = await nextMessage();
         // Reset the no-activity timer: the background loop just delivered.
+        // Re-arm the one-shot so a fresh silent stretch can surface again.
         lastActivityAt = Date.now();
+        noActivityNotified = false;
 
         if (!message) {
           // Background loop signalled done or errored.
