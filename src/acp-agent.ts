@@ -189,6 +189,13 @@ type LastTurnEndReason = "end_turn" | "max_tokens" | "max_turns" | "error" | "ca
  *  the client's stream (defeating staleness) without changing the stream-tail
  *  kind the server uses to tell `resuming` from `working`. */
 export const SESSION_STATUS_NOTIFICATION = "_claude/sessionStatus";
+/** Out-of-band signal (NOT a `session/update`) emitted when the SDK reports a
+ *  `model_refusal_fallback`: the active model refused the turn and the SDK
+ *  transparently fell back to another model, retracting the already-streamed
+ *  refused partial. Carries the retraction record so a client that tracks
+ *  message identity can evict the superseded messages; non-handling clients
+ *  ignore it (no transcript impact). */
+export const MODEL_REFUSAL_FALLBACK_NOTIFICATION = "_claude/modelRefusalFallback";
 /** `_meta` key carrying the terminal turn reason on the final `usage_update`
  *  `session/update` and on the `PromptResponse`. */
 export const LAST_TURN_END_REASON_META_KEY = "_claude/lastTurnEndReason";
@@ -1155,8 +1162,67 @@ export class ClaudeAcpAgent implements Agent {
               case "api_retry":
               case "mirror_error":
               case "permission_denied":
+              case "commands_changed":
+                // `commands_changed` (new in the bundled CC ≥2.1.157): the SDK
+                // pushes the full slash-command list after a mid-session change
+                // (e.g. skills discovered dynamically while working in a
+                // subdirectory). We snapshot commands once at init and surface
+                // them via `sendAvailableCommandsUpdate`; live re-sync of the
+                // command palette is not yet wired through ACP, so this is an
+                // intentional no-op. No client-visible regression — the init
+                // command list stays valid; commands discovered mid-session
+                // simply aren't advertised until the next session load.
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "model_refusal_fallback": {
+                // New in the bundled CC ≥2.1.157. The active model refused this
+                // turn and the SDK transparently fell back to another model
+                // (`direction`: retry/revert/sticky). The refused partial was
+                // already streamed to the client as append-only
+                // `agent_message_chunk` text; `retracted_message_uuids` names the
+                // SDK wire uuids the engine has now evicted so they aren't shown
+                // as a real answer.
+                //
+                // The adapter streams assistant text WITHOUT exposing the SDK
+                // wire uuids to the client, so a generic ACP client cannot today
+                // key off `retracted_message_uuids` to evict the stale partial.
+                // We therefore (a) log the fallback richly for operability — this
+                // SDK drives every Claude session on the box, not just fable — and
+                // (b) propagate the full retraction record out-of-band via an
+                // `extNotification`, so a client that tracks message identity (or
+                // a future adapter change that tags chunks with uuids) can act on
+                // it. `extNotification` is non-invasive: clients that don't handle
+                // the method ignore it, so there is no transcript pollution or
+                // regression for existing clients.
+                const retracted = message.retracted_message_uuids ?? [];
+                this.logger.error(
+                  `Session ${message.session_id}: model_refusal_fallback ` +
+                    `(${message.direction}) ${message.original_model} -> ` +
+                    `${message.fallback_model}` +
+                    (message.api_refusal_category
+                      ? ` [category: ${message.api_refusal_category}]`
+                      : "") +
+                    `; retracted ${retracted.length} message(s).`,
+                );
+                await this.client
+                  .extNotification(MODEL_REFUSAL_FALLBACK_NOTIFICATION, {
+                    sessionId: message.session_id,
+                    direction: message.direction,
+                    originalModel: message.original_model,
+                    fallbackModel: message.fallback_model,
+                    apiRefusalCategory: message.api_refusal_category ?? null,
+                    apiRefusalExplanation: message.api_refusal_explanation ?? null,
+                    retractedMessageUuids: retracted,
+                    content: message.content,
+                  })
+                  .catch((err) => {
+                    this.logger.error(
+                      "Failed to forward model_refusal_fallback notification:",
+                      err,
+                    );
+                  });
+                break;
+              }
               case "thinking_tokens": {
                 // A running token-count *estimate* the SDK digests from thinking
                 // pings (`estimated_tokens`) — not thinking text. On redacted-
@@ -2553,12 +2619,28 @@ export class ClaudeAcpAgent implements Agent {
     // returned `resolvedModelInfos` — not the pre-call `allowedModels` — for
     // every downstream model lookup so the stored `modelInfos`, advertised
     // ids, and `currentModelId` remain mutually consistent.
-    const { state: models, modelInfos: resolvedModelInfos } = await getAvailableModels(
+    const availableModels = await getAvailableModels(
       q,
       allowedModels,
       initializationResult.models,
       settingsManager,
       this.logger,
+    );
+
+    // Advertise the Claude "fable" model. The bundled Claude Code binary knows
+    // and can RUN fable for our Claude Max accounts, but a server-side launch
+    // gate hides it from the advertised model menu — so `initializationResult.
+    // models` never contains it, even on the latest SDK. Inject it here, after
+    // the SDK/allowlist list is resolved, so a generic ACP client (acpx) can
+    // pin `--model fable` and pass the client-side support gate. The injection
+    // runs on EVERY init — new AND resume — via the shared `createSession`
+    // path, which is exactly what keeps the advertised id the literal `fable`
+    // on resume (the SDK would otherwise surface the resolved concrete id
+    // `claude-fable-5`, drifting the advertised value and breaking the acpx
+    // replay gate — the failure mode `opus[1m]` hit). See `injectFableModel`.
+    const { state: models, modelInfos: resolvedModelInfos } = injectFableModel(
+      availableModels.state,
+      availableModels.modelInfos,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
@@ -2704,8 +2786,7 @@ export class ClaudeAcpAgent implements Agent {
         }
       } catch (error) {
         // Claude process died — store error so the prompt can re-throw it.
-        session.backgroundLoopError =
-          error instanceof Error ? error : new Error(String(error));
+        session.backgroundLoopError = error instanceof Error ? error : new Error(String(error));
         if (session.activePromptResolve) {
           const resolve = session.activePromptResolve;
           session.activePromptResolve = null;
@@ -3252,6 +3333,68 @@ function resolveSettingsModel(
   return resolveModelPreference(models, settingsModel);
 }
 
+/** Advertised id / alias for the Claude "fable" model. The bundled Claude Code
+ *  binary resolves this alias to the concrete `claude-fable-5` (CC ≥2.1.172),
+ *  so clients pin the stable `fable` while the SDK runs `claude-fable-5`. */
+const FABLE_MODEL_ID = "fable";
+
+/**
+ * Additively advertise the Claude "fable" model on top of the resolved
+ * SDK/allowlist model set.
+ *
+ * Why this is needed: the bundled Claude Code binary is entitled to RUN fable
+ * for our Claude Max accounts (forcing `--model claude-fable-5`/`fable` runs a
+ * turn), but a server-side launch gate omits fable from the advertised model
+ * menu — `initializationResult.models` / `supportedModels()` never list it,
+ * even on the latest SDK. The acpx client-side support gate
+ * (`assertRequestedModelSupported`) rejects any `--model` value the agent did
+ * not advertise, so without this injection `--model fable` cannot be selected.
+ *
+ * Properties (all required by the design):
+ * - **Additive** — the full base set (Default + sonnet/sonnet[1m]/haiku/
+ *   opus[1m], or whatever the SDK/allowlist resolved) is preserved untouched.
+ *   No restrict-list drift: if Anthropic adds or renames a base model it still
+ *   flows through.
+ * - **Idempotent** — a no-op if `fable` is already advertised. The SDK never
+ *   surfaces it today; a future SDK that does would not get a duplicate, and
+ *   we never collide with an existing entry (`resolveModelPreference(base,
+ *   "fable")` returns `null` against the base set — there is no fuzzy match
+ *   against sonnet/haiku/opus).
+ * - **Resume-stable** — because the caller runs this on EVERY init (new AND
+ *   resume, via the shared `createSession` path), the advertised id stays the
+ *   literal `fable` on reconnect. We never rely on the SDK to surface fable, so
+ *   unlike the removed `opus[1m]` the advertised value does not drift to the
+ *   resolved concrete id (`claude-fable-5`) on resume — which is what kept the
+ *   acpx replay gate accepting the persisted `fable` alias.
+ */
+function injectFableModel(
+  state: SessionModelState,
+  modelInfos: ModelInfo[],
+): { state: SessionModelState; modelInfos: ModelInfo[] } {
+  if (modelInfos.some((m) => m.value === FABLE_MODEL_ID)) {
+    return { state, modelInfos };
+  }
+  const fableInfo: ModelInfo = {
+    value: FABLE_MODEL_ID,
+    displayName: "Fable",
+    description: "Fable",
+  };
+  return {
+    state: {
+      ...state,
+      availableModels: [
+        ...state.availableModels,
+        {
+          modelId: fableInfo.value,
+          name: fableInfo.displayName,
+          description: fableInfo.description,
+        },
+      ],
+    },
+    modelInfos: [...modelInfos, fableInfo],
+  };
+}
+
 /**
  * Restrict the SDK's model list to the user's `availableModels` allowlist
  * (already merged-and-deduped across settings sources by `SettingsManager`).
@@ -3341,7 +3484,8 @@ async function getAvailableModels(
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const userInputWasFuzzyMatch =
     resolvedFromInput !== undefined && currentModel.value !== resolvedFromInput;
-  const skipSetModel = resolvedFromInput === undefined || (!userInputWasFuzzyMatch && sdkSawSameValue);
+  const skipSetModel =
+    resolvedFromInput === undefined || (!userInputWasFuzzyMatch && sdkSawSameValue);
   if (!skipSetModel) {
     await query.setModel(currentModel.value);
   }
@@ -3786,10 +3930,17 @@ export function toAcpNotifications(
                           parentToolUseId: options.parentToolUseId,
                           ...(options.subagentCache?.get(options.parentToolUseId)
                             ? {
-                                subagentId: options.subagentCache.get(options.parentToolUseId)!.agentId,
-                                subagentName: options.subagentCache.get(options.parentToolUseId)!.name,
-                                ...(options.subagentCache.get(options.parentToolUseId)!.color !== undefined
-                                  ? { subagentColor: options.subagentCache.get(options.parentToolUseId)!.color }
+                                subagentId: options.subagentCache.get(options.parentToolUseId)!
+                                  .agentId,
+                                subagentName: options.subagentCache.get(options.parentToolUseId)!
+                                  .name,
+                                ...(options.subagentCache.get(options.parentToolUseId)!.color !==
+                                undefined
+                                  ? {
+                                      subagentColor: options.subagentCache.get(
+                                        options.parentToolUseId,
+                                      )!.color,
+                                    }
                                   : {}),
                               }
                             : {}),

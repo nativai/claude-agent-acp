@@ -450,12 +450,15 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      // `fable` is always appended additively (see `injectFableModel`): the
+      // SDK never surfaces it, so the adapter injects it on every init.
       expect(modelOption.options.map((o: any) => o.value)).toEqual([
         "default",
         "claude-sonnet-4-6[1m]",
         "claude-opus-4-6[1m]",
         "claude-haiku-4-5",
         "claude-opus-4-7[1m]",
+        "fable",
       ]);
     });
 
@@ -490,11 +493,13 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
-      // User and project entries are unioned and deduplicated.
+      // User and project entries are unioned and deduplicated; `fable` is then
+      // appended additively (see `injectFableModel`).
       expect(modelOption.options.map((o: any) => o.value)).toEqual([
         "default",
         "claude-haiku-4-5",
         "claude-opus-4-7[1m]",
+        "fable",
       ]);
     });
 
@@ -522,7 +527,9 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
-      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default"]);
+      // Empty allowlist keeps only Default; `fable` is still appended additively
+      // (the injection is independent of the allowlist — see `injectFableModel`).
+      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default", "fable"]);
     });
 
     it("does not filter when availableModels is absent from settings", async () => {
@@ -544,7 +551,44 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
-      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default", "haiku"]);
+      // No allowlist → SDK list passes through unchanged, then `fable` is
+      // appended additively (see `injectFableModel`).
+      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default", "haiku", "fable"]);
+    });
+
+    it("advertises fable additively and idempotently on every init", async () => {
+      // The bundled Claude Code binary can RUN fable but never advertises it
+      // (server-side launch gate), so the adapter injects it unconditionally.
+      // This guards the additive + idempotent contract and the resume-stability
+      // it underwrites: because `fable` is re-asserted on every `createSession`
+      // (new AND resume), its advertised id never drifts to `claude-fable-5`.
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      // SDK list already containing a `fable` entry must NOT be duplicated.
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "sonnet", displayName: "Sonnet", description: "Sonnet" },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+        { value: "fable", displayName: "Fable", description: "Fable" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      const values = modelOption.options.map((o: any) => o.value);
+      // Base set preserved, fable present exactly once (idempotent).
+      expect(values).toEqual(["default", "sonnet", "haiku", "fable"]);
+      expect(values.filter((v: string) => v === "fable")).toHaveLength(1);
+      // Advertised via the top-level session model state too.
+      expect(response.models.availableModels.map((m: any) => m.modelId)).toContain("fable");
     });
 
     it("passes the user's exact ID to setModel when it matches an SDK alias", async () => {
@@ -720,11 +764,14 @@ describe("ClaudeAcpAgent settings", () => {
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
 
     const advertisedFor = async (models: any[]): Promise<string[]> => {
-      querySpy.mockImplementation(() => ({
-        initializationResult: async () => ({ models }),
-        setModel: vi.fn(),
-        supportedCommands: async () => [],
-      }) as any);
+      querySpy.mockImplementation(
+        () =>
+          ({
+            initializationResult: async () => ({ models }),
+            setModel: vi.fn(),
+            supportedCommands: async () => [],
+          }) as any,
+      );
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
       const response = await (agent as any).createSession({
         cwd: projectDir,
