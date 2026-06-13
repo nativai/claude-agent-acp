@@ -2638,9 +2638,13 @@ export class ClaudeAcpAgent implements Agent {
     // on resume (the SDK would otherwise surface the resolved concrete id
     // `claude-fable-5`, drifting the advertised value and breaking the acpx
     // replay gate — the failure mode `opus[1m]` hit). See `injectFableModel`.
-    const { state: models, modelInfos: resolvedModelInfos } = injectFableModel(
+    const __fableInjected = injectFableModel(
       availableModels.state,
       availableModels.modelInfos,
+    );
+    const { state: models, modelInfos: resolvedModelInfos } = injectOpusModel(
+      __fableInjected.state,
+      __fableInjected.modelInfos,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
@@ -3337,6 +3341,7 @@ function resolveSettingsModel(
  *  binary resolves this alias to the concrete `claude-fable-5` (CC ≥2.1.172),
  *  so clients pin the stable `fable` while the SDK runs `claude-fable-5`. */
 const FABLE_MODEL_ID = "fable";
+const OPUS_MODEL_ID = "opus";
 
 /**
  * Additively advertise the Claude "fable" model on top of the resolved
@@ -3392,6 +3397,34 @@ function injectFableModel(
       ],
     },
     modelInfos: [...modelInfos, fableInfo],
+  };
+}
+
+function injectOpusModel(
+  state: SessionModelState,
+  modelInfos: ModelInfo[],
+): { state: SessionModelState; modelInfos: ModelInfo[] } {
+  if (modelInfos.some((m) => m.value === OPUS_MODEL_ID)) {
+    return { state, modelInfos };
+  }
+  const opusInfo: ModelInfo = {
+    value: OPUS_MODEL_ID,
+    displayName: "Opus",
+    description: "Opus 4.8",
+  };
+  return {
+    state: {
+      ...state,
+      availableModels: [
+        ...state.availableModels,
+        {
+          modelId: opusInfo.value,
+          name: opusInfo.displayName,
+          description: opusInfo.description,
+        },
+      ],
+    },
+    modelInfos: [...modelInfos, opusInfo],
   };
 }
 
