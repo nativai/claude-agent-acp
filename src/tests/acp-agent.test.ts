@@ -2145,6 +2145,121 @@ describe("getOrCreateSession param change detection", () => {
   });
 });
 
+describe("FW-12: lazy-resume of out-of-band durable fork id", () => {
+  // acpx's Claude copy path replaces the id our session/fork returns with its
+  // own durable forked-transcript id, then drives session/set_model (and
+  // config ops) on that id over the same connection WITHOUT a prior
+  // session/resume. Those ops must lazily resume the durable transcript from
+  // disk instead of throwing "Session not found" (-32603) — FW-12.
+  function createMockAgent() {
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function registerLiveSession(agent: ClaudeAcpAgent, sessionId: string, cwd: string) {
+    function* empty() {}
+    const gen = Object.assign(empty(), {
+      interrupt: vi.fn(),
+      close: vi.fn(),
+      setModel: vi.fn(),
+      setPermissionMode: vi.fn(),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+    });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      cwd,
+      sessionFingerprint: "fp",
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      activePromptResolve: null,
+      backgroundLoopError: null,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    return agent.sessions[sessionId]!;
+  }
+
+  it("does not attempt a resume for an unknown id when no fork happened on this connection", async () => {
+    const agent = createMockAgent();
+    const spy = vi.spyOn(agent as any, "getOrCreateSession");
+    await expect(
+      agent.unstable_setSessionModel({ sessionId: "never-seen", modelId: "sonnet" }),
+    ).rejects.toThrow("Session not found");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("lazily resumes the durable fork id on post-fork set_model, using the fork's cwd", async () => {
+    const agent = createMockAgent();
+    (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
+    const durableId = "durable-fork-id";
+    const getOrCreate = vi
+      .spyOn(agent as any, "getOrCreateSession")
+      .mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as { sessionId: string; cwd: string };
+        registerLiveSession(agent, p.sessionId, p.cwd);
+        return { sessionId: p.sessionId };
+      });
+    const updateSpy = vi.spyOn(agent as any, "updateConfigOption").mockResolvedValue(undefined);
+
+    await expect(
+      agent.unstable_setSessionModel({ sessionId: durableId, modelId: "sonnet" }),
+    ).resolves.toBeUndefined();
+
+    expect(getOrCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: durableId, cwd: "/fork-cwd" }),
+    );
+    expect(agent.sessions[durableId]!.query.setModel).toHaveBeenCalledWith("sonnet");
+    expect(updateSpy).toHaveBeenCalled();
+  });
+
+  it("falls back to 'Session not found' when the durable transcript cannot be resumed", async () => {
+    const agent = createMockAgent();
+    (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
+    vi.spyOn(agent as any, "getOrCreateSession").mockRejectedValue(
+      new Error("No conversation found with session ID"),
+    );
+    await expect(
+      agent.unstable_setSessionModel({ sessionId: "missing-durable", modelId: "sonnet" }),
+    ).rejects.toThrow("Session not found");
+  });
+
+  it("applies the same lazy resume to set_config_option after a fork", async () => {
+    const agent = createMockAgent();
+    (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
+    const getOrCreate = vi
+      .spyOn(agent as any, "getOrCreateSession")
+      .mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as { sessionId: string; cwd: string };
+        registerLiveSession(agent, p.sessionId, p.cwd);
+        return { sessionId: p.sessionId };
+      });
+    // The mock session advertises no config options, so resolution succeeds and
+    // we reach the option lookup — proving the session was resolved (not "Session not found").
+    await expect(
+      agent.setSessionConfigOption({ sessionId: "durable-2", configId: "model", value: "sonnet" }),
+    ).rejects.toThrow("Unknown config option");
+    expect(getOrCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "durable-2", cwd: "/fork-cwd" }),
+    );
+  });
+});
+
 describe("usage_update computation", () => {
   function createAssistantMessage(overrides: {
     model: string;

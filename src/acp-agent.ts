@@ -583,6 +583,25 @@ export class ClaudeAcpAgent implements Agent {
   /** Maps parent tool use ID → subagent info for spawned teammates. */
   subagentCache: Map<string, SubagentInfo> = new Map();
 
+  /**
+   * Creation params of the most recent `session/fork` on this connection.
+   *
+   * When acpx copies a Claude session it does NOT trust the id our
+   * `unstable_forkSession` returns: it materializes its own *durable* forked
+   * transcript (a fresh, independent session id) and then drives
+   * `session/set_model` / `session/set_config_option` on that id over the same
+   * connection — without a preceding `session/resume`. That id was therefore
+   * never registered in `sessions`, so the config op would fail "Session not
+   * found". We keep the fork's creation context here so those ops can lazily
+   * resume the durable transcript from disk (see `resolveSessionForConfigOp`).
+   */
+  private lastForkContext?: {
+    cwd: string;
+    mcpServers: NewSessionRequest["mcpServers"];
+    additionalDirectories?: NewSessionRequest["additionalDirectories"];
+    _meta?: NewSessionRequest["_meta"];
+  };
+
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
     this.client = client;
@@ -751,6 +770,15 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    // Remember the fork's creation context so a follow-up set_model/config on
+    // acpx's out-of-band durable fork id can lazily resume it (see
+    // `lastForkContext` / `resolveSessionForConfigOp`).
+    this.lastForkContext = {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    };
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1759,7 +1787,7 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    const session = this.sessions[params.sessionId];
+    const session = await this.resolveSessionForConfigOp(params.sessionId);
     if (!session) {
       throw new Error("Session not found");
     }
@@ -1773,7 +1801,7 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    if (!this.sessions[params.sessionId]) {
+    if (!(await this.resolveSessionForConfigOp(params.sessionId))) {
       throw new Error("Session not found");
     }
 
@@ -1785,7 +1813,7 @@ export class ClaudeAcpAgent implements Agent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
-    const session = this.sessions[params.sessionId];
+    const session = await this.resolveSessionForConfigOp(params.sessionId);
     if (!session) {
       throw new Error("Session not found");
     }
@@ -2214,6 +2242,42 @@ export class ClaudeAcpAgent implements Agent {
         });
       }
     }
+  }
+
+  /**
+   * Resolve the in-memory session for a per-session config op (set_model /
+   * set_mode / set_config_option), lazily resuming a forked session that acpx
+   * minted out-of-band and never registered here (see `lastForkContext`).
+   *
+   * acpx's Claude copy path replaces our fork id with its own durable forked
+   * transcript id, then calls these ops on that id over the same connection
+   * with no preceding `session/resume`. The durable transcript exists on disk,
+   * so we resume it here using the originating fork's cwd/mcpServers/_meta.
+   * Returns undefined when it cannot be resolved — callers then surface the
+   * usual "Session not found", so a genuinely-unknown id behaves as before.
+   */
+  private async resolveSessionForConfigOp(sessionId: string): Promise<Session | undefined> {
+    const existing = this.sessions[sessionId];
+    if (existing) {
+      return existing;
+    }
+    const ctx = this.lastForkContext;
+    if (!ctx) {
+      return undefined;
+    }
+    try {
+      await this.getOrCreateSession({
+        sessionId,
+        cwd: ctx.cwd,
+        mcpServers: ctx.mcpServers,
+        additionalDirectories: ctx.additionalDirectories,
+        _meta: ctx._meta,
+      });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: lazy resume of forked session failed:`, error);
+      return undefined;
+    }
+    return this.sessions[sessionId];
   }
 
   private async getOrCreateSession(params: {
