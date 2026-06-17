@@ -1224,4 +1224,73 @@ describe("session config options", () => {
       expect(optionIds).toContain("auto");
     });
   });
+
+  // ----------------------------------------------------------------------
+  // BUG2 regression lock (test-engineer, task bugs/spawn-flags-ignored-
+  // effort-config-rejected). The filed bug: `--reasoning-effort` aborted the
+  // turn with "Unknown config option: effort" because the (mis-resolved)
+  // current model advertised no effort levels. The adapter advertises the
+  // `effort` config option iff the current model's ModelInfo.supportsEffort is
+  // set. acpx pins models via `--model` from {default, sonnet, opus, fable};
+  // all four must advertise effort so `--reasoning-effort` is accepted. These
+  // supportsEffort fixtures mirror the DEPLOYED adapter, independently verified
+  // BEHAVIORALLY on a live spawn (see the task VERIFICATION.md runbook: opus &
+  // default ran effort low-vs-max with output-token delta 2000→7790; sonnet
+  // applied effort; fable advertises effort). haiku does NOT advertise effort
+  // (its effort-replay loses the first turn — tracked separately as
+  // bugs/haiku-effort-replay-loses-first-turn.md). This pins the advertisement
+  // gate so a future model-resolution refactor cannot silently re-sever it for
+  // the pinnable model set.
+  describe("BUG2: effort advertised for {default,sonnet,opus,fable}, not haiku", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    // value strings = the model ids the adapter advertises for these families:
+    // the SDK default resolves to opus 4.8; `opus`/`fable` are the additively
+    // injected aliases; sonnet/haiku are concrete ids.
+    const MODEL_INFOS = [
+      { value: "claude-opus-4-8", displayName: "Default", description: "default → opus 4.8", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "max"] },
+      { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "sonnet", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high"] },
+      { value: "opus", displayName: "Opus", description: "opus alias", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "max"] },
+      { value: "fable", displayName: "Fable", description: "fable alias", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high"] },
+      { value: "claude-haiku-4-5", displayName: "Haiku", description: "haiku", supportsEffort: false },
+    ];
+
+    function seedModels(target: string) {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      // start from a model different from the target so the switch is a real change
+      const baseline = MODEL_INFOS.find((m) => m.value !== target)!.value;
+      session.modelInfos = structuredClone(MODEL_INFOS);
+      session.models = {
+        currentModelId: baseline,
+        availableModels: MODEL_INFOS.map((m) => ({ modelId: m.value, name: m.displayName, description: m.description })),
+      };
+      sessionUpdates.length = 0;
+    }
+
+    function effortOptionAfterSwitch(modelId: string): any {
+      const configUpdate = sessionUpdates.find((n) => n.update.sessionUpdate === "config_option_update");
+      expect(configUpdate, `model switch to ${modelId} must emit config_option_update`).toBeDefined();
+      return (configUpdate?.update as any).configOptions.find((o: any) => o.id === "effort");
+    }
+
+    for (const modelId of ["claude-opus-4-8", "claude-sonnet-4-6", "opus", "fable"]) {
+      it(`advertises an effort config option when current model is "${modelId}"`, async () => {
+        seedModels(modelId);
+        await agent.unstable_setSessionModel({ sessionId: SESSION_ID, modelId });
+        const effortOption = effortOptionAfterSwitch(modelId);
+        expect(effortOption, `effort must be advertised for ${modelId}`).toBeDefined();
+        // "default" + at least one real level → `--reasoning-effort` is accepted.
+        expect(effortOption.options.length).toBeGreaterThan(1);
+      });
+    }
+
+    it('does NOT advertise effort for "claude-haiku-4-5" (supportsEffort: false)', async () => {
+      seedModels("claude-haiku-4-5");
+      await agent.unstable_setSessionModel({ sessionId: SESSION_ID, modelId: "claude-haiku-4-5" });
+      const effortOption = effortOptionAfterSwitch("claude-haiku-4-5");
+      expect(effortOption).toBeUndefined();
+    });
+  });
 });
