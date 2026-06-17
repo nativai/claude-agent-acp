@@ -1236,25 +1236,31 @@ describe("session config options", () => {
   // supportsEffort fixtures mirror the DEPLOYED adapter, independently verified
   // BEHAVIORALLY on a live spawn (see the task VERIFICATION.md runbook: opus &
   // default ran effort low-vs-max with output-token delta 2000→7790; sonnet
-  // applied effort; fable advertises effort). haiku does NOT advertise effort
-  // (its effort-replay loses the first turn — tracked separately as
-  // bugs/haiku-effort-replay-loses-first-turn.md). This pins the advertisement
-  // gate so a future model-resolution refactor cannot silently re-sever it for
-  // the pinnable model set.
-  describe("BUG2: effort advertised for {default,sonnet,opus,fable}, not haiku", () => {
+  // applied effort; fable advertises effort).
+  //
+  // NOTE on haiku: the DEPLOYED adapter actually ADVERTISES effort for haiku at
+  // session/new too (supportsEffort is true), yet REJECTS the set_config_option
+  // (effort) MUTATION for it — a distinct issue from advertisement, handled on
+  // the acpx side by the non-fatal effort-replay fix (reconnect.ts; task
+  // bugs/haiku-effort-replay-loses-first-turn). So haiku is deliberately NOT a
+  // negative case here. The negative below uses a generic supportsEffort:false
+  // model purely to prove the advertisement gate is real (not vacuously always-on),
+  // so a future model-resolution refactor cannot silently re-sever it.
+  describe("BUG2: effort config option advertised iff current model supportsEffort", () => {
     beforeEach(() => {
       populateSession();
     });
 
     // value strings = the model ids the adapter advertises for these families:
     // the SDK default resolves to opus 4.8; `opus`/`fable` are the additively
-    // injected aliases; sonnet/haiku are concrete ids.
+    // injected aliases; sonnet is a concrete id. The last entry is a generic
+    // no-effort model (hypothetical) used only as the gate-teeth negative.
     const MODEL_INFOS = [
       { value: "claude-opus-4-8", displayName: "Default", description: "default → opus 4.8", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "max"] },
       { value: "claude-sonnet-4-6", displayName: "Sonnet", description: "sonnet", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high"] },
       { value: "opus", displayName: "Opus", description: "opus alias", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "max"] },
       { value: "fable", displayName: "Fable", description: "fable alias", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high"] },
-      { value: "claude-haiku-4-5", displayName: "Haiku", description: "haiku", supportsEffort: false },
+      { value: "model-without-effort-support", displayName: "No-Effort", description: "hypothetical model with no effort support", supportsEffort: false },
     ];
 
     function seedModels(target: string) {
@@ -1286,10 +1292,10 @@ describe("session config options", () => {
       });
     }
 
-    it('does NOT advertise effort for "claude-haiku-4-5" (supportsEffort: false)', async () => {
-      seedModels("claude-haiku-4-5");
-      await agent.unstable_setSessionModel({ sessionId: SESSION_ID, modelId: "claude-haiku-4-5" });
-      const effortOption = effortOptionAfterSwitch("claude-haiku-4-5");
+    it("does NOT advertise effort for a model with supportsEffort:false (gate teeth)", async () => {
+      seedModels("model-without-effort-support");
+      await agent.unstable_setSessionModel({ sessionId: SESSION_ID, modelId: "model-without-effort-support" });
+      const effortOption = effortOptionAfterSwitch("model-without-effort-support");
       expect(effortOption).toBeUndefined();
     });
   });
