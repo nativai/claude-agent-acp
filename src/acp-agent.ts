@@ -2156,19 +2156,23 @@ export class ClaudeAcpAgent implements Agent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
     } else if (configId === "model") {
+      // Resolve the new model's `ModelInfo` once: its `description` feeds the
+      // context-window heuristic below, and `supportsAutoMode` the mode clamp.
+      const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
         // The cached context window was learned for the previous model; reset
         // to the new model's heuristic so mid-stream updates between now and
         // the next `result` reflect the user's selection instead of the old
-        // model's window.
-        session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
+        // model's window. Pass the description so the 1M-context `default`
+        // model is told apart from plain `opus` (they share a base model id).
+        session.contextWindowSize =
+          inferContextWindowFromModel(value, newModelInfo?.description) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
 
       // Recompute availableModes for the new model and clamp the current
       // mode if the SDK no longer offers it (today: "auto" on Haiku).
       // `ModelInfo.supportsAutoMode` is the canonical SDK signal.
-      const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const newAvailableModes = buildAvailableModes(newModelInfo);
       // Capture BEFORE mutating session.modes so the log message reflects
       // the invalidated mode rather than "default".
@@ -2795,7 +2799,8 @@ export class ClaudeAcpAgent implements Agent {
       activePromptResolve: null,
       backgroundLoopError: null,
       contextWindowSize:
-        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+        inferContextWindowFromModel(models.currentModelId, currentModelInfo?.description) ??
+        DEFAULT_CONTEXT_WINDOW,
       taskState,
     };
 
@@ -4218,13 +4223,26 @@ function commonPrefixLength(a: string, b: string) {
   return i;
 }
 
-/** Best-effort first guess of a model's context window from its ID, used only
- *  until a `result` message arrives with the authoritative `modelUsage` value.
- *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
- *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. */
-function inferContextWindowFromModel(model: string): number | null {
+/** Best-effort first guess of a model's context window, used only until a
+ *  `result` message arrives with the authoritative `modelUsage.contextWindow`.
+ *
+ *  Two pre-result signals, checked in order:
+ *  1. A `1m` token in the model ID — Anthropic's explicit 1M-context variants
+ *     and the `opus[1m]`/`sonnet[1m]` display aliases encode "1m" as a distinct
+ *     token (e.g. "claude-opus-4-6-1m"); `\b1m\b` catches it without also
+ *     matching "10m" or an embedded substring.
+ *  2. "1M context" in the model's `description`. This is the ONLY pre-result
+ *     signal that separates the box-default `default` model (Opus 4.8 *with 1M
+ *     context* → 1,000,000) from plain `opus` (Opus 4.8 → 200,000): both
+ *     resolve to the same base API model id (`claude-opus-4-8`), so the ID
+ *     alone cannot tell them apart. The model menu's own description carries
+ *     the distinction — the `default` ModelInfo reads "Opus 4.8 with 1M
+ *     context", while `opus`'s reads just "Opus 4.8" and stays at the default.
+ *     `description` is the SDK `ModelInfo.description` ("Description of the
+ *     model's capabilities"); there is no structured context-window field. */
+export function inferContextWindowFromModel(model: string, description?: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
+  if (description && /\b1m\b[\s_-]*context/i.test(description)) return 1_000_000;
   return null;
 }
 

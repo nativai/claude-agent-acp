@@ -32,6 +32,7 @@ import {
   ClaudeAcpAgent,
   claudeCliPath,
   describeAlwaysAllow,
+  inferContextWindowFromModel,
   streamEventToAcpNotifications,
   RESUME_HEARTBEAT_MS,
   INIT_HARD_MS,
@@ -2260,6 +2261,51 @@ describe("FW-12: lazy-resume of out-of-band durable fork id", () => {
   });
 });
 
+describe("inferContextWindowFromModel", () => {
+  it("infers 1M from a `1m` token in the model id", () => {
+    expect(inferContextWindowFromModel("claude-opus-4-6-1m")).toBe(1_000_000);
+    expect(inferContextWindowFromModel("opus[1m]")).toBe(1_000_000);
+    expect(inferContextWindowFromModel("sonnet[1m]")).toBe(1_000_000);
+  });
+
+  it("does not treat `10m`/`41m` as the 1M token", () => {
+    expect(inferContextWindowFromModel("claude-foo-10m")).toBeNull();
+    expect(inferContextWindowFromModel("claude-opus-41m")).toBeNull();
+  });
+
+  it("infers 1M from a '1M context' description when the id has no token", () => {
+    // The box-default `default` model shares the base API id `claude-opus-4-8`
+    // with plain `opus`, so only the model-menu description ("Opus 4.8 with 1M
+    // context") reveals its 1M window.
+    expect(
+      inferContextWindowFromModel(
+        "default",
+        "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+      ),
+    ).toBe(1_000_000);
+    expect(inferContextWindowFromModel("opus[1m]", "Opus 1M context")).toBe(1_000_000);
+  });
+
+  it("keeps plain `opus` (Opus 4.8) at the default 200k window", () => {
+    // The crux of W13-12: `opus` and `default` are both Opus 4.8 with the same
+    // base id; only `default`'s description mentions 1M, so `opus` must NOT be
+    // flagged (`null` → caller falls back to DEFAULT_CONTEXT_WINDOW = 200k).
+    expect(inferContextWindowFromModel("opus", "Opus 4.8")).toBeNull();
+  });
+
+  it("does not mis-flag descriptions that mention 1M but not '1M context'", () => {
+    expect(inferContextWindowFromModel("haiku", "Fast · up to 1M tokens output")).toBeNull();
+    expect(
+      inferContextWindowFromModel("sonnet", "Sonnet 4.6 · Efficient for routine tasks"),
+    ).toBeNull();
+  });
+
+  it("returns null with no id token and no description", () => {
+    expect(inferContextWindowFromModel("default")).toBeNull();
+    expect(inferContextWindowFromModel("claude-opus-4-8")).toBeNull();
+  });
+});
+
 describe("usage_update computation", () => {
   function createAssistantMessage(overrides: {
     model: string;
@@ -2759,6 +2805,91 @@ describe("usage_update computation", () => {
     expect(usageUpdates).toHaveLength(2);
     expect(usageUpdates[0].update.size).toBe(1000000);
     expect(usageUpdates[1].update.size).toBe(1000000);
+  });
+
+  it("switching to the 1M-context `default` model seeds 1M from its description", async () => {
+    // Regression for W13-12: the box-default `default` model is "Opus 4.8 with
+    // 1M context" but shares the base API id `claude-opus-4-8` with plain `opus`
+    // (200k). The model id alone can't tell them apart, so the heuristic reads
+    // the model menu's description to seed 1M at model-switch time — no 200k
+    // flash until the next `result`.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        // Both `opus` and `default` report this same base id on the wire.
+        model: "claude-opus-4-8",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-8": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    // The `default` model's ModelInfo carries the 1M-context description; plain
+    // `opus`'s does not.
+    session.modelInfos = [
+      {
+        value: "default",
+        displayName: "Default (recommended)",
+        description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+      },
+      { value: "opus", displayName: "Opus", description: "Opus 4.8" },
+    ];
+    // Start on plain `opus` (200k) so switching *to* `default` exercises the
+    // window reset (a no-op same-model switch would skip it).
+    session.models = { currentModelId: "opus", availableModels: [] } as any;
+    session.contextWindowSize = 200000;
+    expect(session.contextWindowSize).toBe(200000);
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
+    expect(session.contextWindowSize).toBe(1000000);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(2);
+    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[1].update.size).toBe(1000000);
+  });
+
+  it("switching to plain `opus` stays at 200k (shares base id with `default`)", async () => {
+    // The other half of the W13-12 crux: `opus` is also Opus 4.8, but its
+    // description ("Opus 4.8") has no "1M context", so the heuristic must NOT
+    // flag it — it resets to the 200k default even coming from a 1M model.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [
+      {
+        value: "default",
+        displayName: "Default (recommended)",
+        description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+      },
+      { value: "opus", displayName: "Opus", description: "Opus 4.8" },
+    ];
+    // Pretend a prior 1M model was active so the reset to 200k is observable.
+    session.contextWindowSize = 1000000;
+    session.models = { currentModelId: "default", availableModels: [] } as any;
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "opus");
+    expect(session.contextWindowSize).toBe(200000);
   });
 
   it("result with no matching modelUsage preserves the learned window", async () => {
