@@ -222,9 +222,13 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     // Bad model is ignored at the usage site; falls back to the first SDK model.
-    // No setModel call is needed because no override was applied — the SDK is
-    // already on its own default.
-    expect(setModelSpy).not.toHaveBeenCalled();
+    // No concrete override resolved (resolvedFromInput === undefined), so the
+    // box-default path ACTIVELY resets the SDK to its own default via
+    // setModel(undefined) — a no-op on session/new, but on session/resume it
+    // clears a replayed `/model <x>` pin so the live model matches the advertised
+    // default (W13-24-11 R2). The advertised id is unchanged (models[0]).
+    expect(setModelSpy).toHaveBeenCalledTimes(1);
+    expect(setModelSpy).toHaveBeenCalledWith(undefined);
     expect(response.models.currentModelId).toBe("claude-sonnet-4-6");
   });
 

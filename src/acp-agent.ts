@@ -1796,7 +1796,15 @@ export class ClaudeAcpAgent implements Agent {
     // silently dropped.
     const resolved = resolveModelPreference(session.modelInfos, params.modelId);
     const modelId = resolved?.value ?? params.modelId;
-    await session.query.setModel(modelId);
+    // When the selection is the synthesized box-default entry, the literal
+    // string "default" is NOT a real SDK model id — map it to the SDK's
+    // documented "use the default" (`setModel(undefined)`), the same reset the
+    // box-default path in getAvailableModels uses. A CONCRETE model
+    // (sonnet/haiku/opus/fable/...) still applies that exact value. We persist
+    // the resume-safe "default" id either way, never `undefined`.
+    const isBoxDefault =
+      resolved?.value === "default" || params.modelId === "" || params.modelId === "default";
+    await session.query.setModel(isBoxDefault ? undefined : modelId);
     await this.updateConfigOption(params.sessionId, "model", modelId);
   }
 
@@ -3586,10 +3594,24 @@ async function getAvailableModels(
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const userInputWasFuzzyMatch =
     resolvedFromInput !== undefined && currentModel.value !== resolvedFromInput;
-  const skipSetModel =
-    resolvedFromInput === undefined || (!userInputWasFuzzyMatch && sdkSawSameValue);
-  if (!skipSetModel) {
-    await query.setModel(currentModel.value);
+  if (resolvedFromInput === undefined) {
+    // Box-default config (no ANTHROPIC_MODEL / settings.model override). ACTIVELY
+    // reset the SDK to its own default model instead of skipping setModel. On
+    // session/new this is a no-op (the SDK is already on its default); on
+    // session/resume it CLEARS a `/model <x>` slash command the SDK persisted and
+    // replayed from the transcript, so the live serving model matches the
+    // advertised "default" (box default == Opus 4.8 / 1M) rather than a stale pin.
+    // The literal string "default" is NOT a real model id; `undefined` is the
+    // SDK's documented "use the default" (sdk.d.ts: setModel(model?: string) —
+    // "or undefined to use the default").
+    await query.setModel(undefined);
+  } else {
+    // Concrete override resolved from input: skip only when the SDK already landed
+    // on the exact same value (no fuzzy/alias rewrite). Unchanged from before.
+    const skipSetModel = !userInputWasFuzzyMatch && sdkSawSameValue;
+    if (!skipSetModel) {
+      await query.setModel(currentModel.value);
+    }
   }
 
   // Keep the advertised model id STABLE for the user's pinned model across
