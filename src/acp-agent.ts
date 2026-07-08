@@ -1015,7 +1015,7 @@ export class ClaudeAcpAgent implements Agent {
                 if (message.status === "compacting") {
                   compactionInProgress = true;
                   await this.client.sessionUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: { type: "text", text: "Compacting..." },
@@ -1027,7 +1027,7 @@ export class ClaudeAcpAgent implements Agent {
                   // message (which only fires when there's content to compact).
                   compactionInProgress = false;
                   await this.client.sessionUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: { type: "text", text: "\n\nCompacting completed." },
@@ -1037,7 +1037,7 @@ export class ClaudeAcpAgent implements Agent {
                   compactionInProgress = false;
                   const reason = message.compact_error ? `: ${message.compact_error}` : ".";
                   await this.client.sessionUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: { type: "text", text: `\n\nCompacting failed${reason}` },
@@ -1065,7 +1065,7 @@ export class ClaudeAcpAgent implements Agent {
                 lastAssistantTotalUsage = 0;
                 lastAssistantUsage = null;
                 await this.client.sessionUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "usage_update",
                     used: 0,
@@ -1076,7 +1076,7 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "local_command_output": {
                 await this.client.sessionUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text: message.content },
@@ -1160,7 +1160,7 @@ export class ClaudeAcpAgent implements Agent {
                   ? "Recalled synthesized memory"
                   : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
                 await this.client.sessionUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "tool_call",
                     toolCallId: message.uuid,
@@ -1224,7 +1224,7 @@ export class ClaudeAcpAgent implements Agent {
                 // regression for existing clients.
                 const retracted = message.retracted_message_uuids ?? [];
                 this.logger.error(
-                  `Session ${message.session_id}: model_refusal_fallback ` +
+                  `Session ${params.sessionId}: model_refusal_fallback ` +
                     `(${message.direction}) ${message.original_model} -> ` +
                     `${message.fallback_model}` +
                     (message.api_refusal_category
@@ -1234,7 +1234,7 @@ export class ClaudeAcpAgent implements Agent {
                 );
                 await this.client
                   .extNotification(MODEL_REFUSAL_FALLBACK_NOTIFICATION, {
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     direction: message.direction,
                     originalModel: message.original_model,
                     fallbackModel: message.fallback_model,
@@ -1271,7 +1271,7 @@ export class ClaudeAcpAgent implements Agent {
                   lastThinkingTokensAt = now;
                   lastThinkingTokensValue = estimated;
                   await this.client.sessionUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: {
                       sessionUpdate: "agent_thought_chunk",
                       content: { type: "text", text: "" },
