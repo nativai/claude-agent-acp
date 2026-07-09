@@ -2229,15 +2229,19 @@ describe("FW-12: lazy-resume of out-of-band durable fork id", () => {
     expect(updateSpy).toHaveBeenCalled();
   });
 
-  it("falls back to 'Session not found' when the durable transcript cannot be resumed", async () => {
+  it("surfaces the underlying resume error (not opaque 'Session not found') when the durable transcript cannot be resumed", async () => {
     const agent = createMockAgent();
     (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
     vi.spyOn(agent as any, "getOrCreateSession").mockRejectedValue(
       new Error("No conversation found with session ID"),
     );
+    // Fork brick 29efbe0c: when the lazy resume of an out-of-band durable fork id
+    // throws, the real reason must reach acpx/the UI so a failed non-default-model
+    // fork is diagnosable — it must NOT be collapsed to an opaque "Session not
+    // found" (which is reserved for a genuinely-unknown id / no lastForkContext).
     await expect(
       agent.unstable_setSessionModel({ sessionId: "missing-durable", modelId: "sonnet" }),
-    ).rejects.toThrow("Session not found");
+    ).rejects.toThrow("No conversation found with session ID");
   });
 
   it("applies the same lazy resume to set_config_option after a fork", async () => {

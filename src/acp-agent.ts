@@ -2265,8 +2265,15 @@ export class ClaudeAcpAgent implements Agent {
    * transcript id, then calls these ops on that id over the same connection
    * with no preceding `session/resume`. The durable transcript exists on disk,
    * so we resume it here using the originating fork's cwd/mcpServers/_meta.
-   * Returns undefined when it cannot be resolved — callers then surface the
-   * usual "Session not found", so a genuinely-unknown id behaves as before.
+   *
+   * Returns undefined only for a genuinely-unknown id (no `lastForkContext`) —
+   * callers surface the usual "Session not found", so that case behaves as
+   * before. But when a lazy resume-from-disk actually THROWS, we now re-throw
+   * the underlying error instead of collapsing it to undefined. Previously the
+   * throw was swallowed and callers reported an opaque "Session not found",
+   * hiding the real reason — which made non-default-model fork creation fail
+   * with no diagnosable cause (fork brick 29efbe0c). Surfacing the error lets it
+   * reach acpx/the UI.
    */
   private async resolveSessionForConfigOp(sessionId: string): Promise<Session | undefined> {
     const existing = this.sessions[sessionId];
@@ -2278,6 +2285,14 @@ export class ClaudeAcpAgent implements Agent {
       return undefined;
     }
     try {
+      // TODO(fork brick 29efbe0c, staging step-0): `ctx.cwd` is the fork
+      // *request* cwd. For a cross-cwd Claude copy that is the SOURCE cwd, while
+      // acpx materializes the durable transcript at the DESTINATION cwd — so this
+      // resume can look in the wrong project dir (candidate cause "B1"). Not
+      // changed here because it is unconfirmed: the staging step-0 adapter log
+      // (this catch's error line) must first show whether the throw is B1 (cwd),
+      // B2 (config-dir/subscription) or B3 (transcript not resumable). Do not
+      // guess the cwd change before that evidence.
       await this.getOrCreateSession({
         sessionId,
         cwd: ctx.cwd,
@@ -2287,7 +2302,11 @@ export class ClaudeAcpAgent implements Agent {
       });
     } catch (error) {
       this.logger.error(`Session ${sessionId}: lazy resume of forked session failed:`, error);
-      return undefined;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw RequestError.internalError(
+        undefined,
+        `Failed to resume forked session ${sessionId} for config op: ${detail}`,
+      );
     }
     return this.sessions[sessionId];
   }
@@ -2714,10 +2733,7 @@ export class ClaudeAcpAgent implements Agent {
     // on resume (the SDK would otherwise surface the resolved concrete id
     // `claude-fable-5`, drifting the advertised value and breaking the acpx
     // replay gate — the failure mode `opus[1m]` hit). See `injectFableModel`.
-    const __fableInjected = injectFableModel(
-      availableModels.state,
-      availableModels.modelInfos,
-    );
+    const __fableInjected = injectFableModel(availableModels.state, availableModels.modelInfos);
     const { state: models, modelInfos: resolvedModelInfos } = injectOpusModel(
       __fableInjected.state,
       __fableInjected.modelInfos,
