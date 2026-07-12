@@ -1796,6 +1796,14 @@ export class ClaudeAcpAgent implements Agent {
     // silently dropped.
     const resolved = resolveModelPreference(session.modelInfos, params.modelId);
     const modelId = resolved?.value ?? params.modelId;
+    // Re-attach an explicit `[1m]` context hint the base ModelInfo dropped, so
+    // the binary receives e.g. "sonnet[1m]" (strips the suffix + enables the
+    // long-context beta) instead of the stripped "sonnet" (which runs at 200k).
+    // Storing the `[1m]` form as currentModelId also makes the reported window
+    // 1M (inferContextWindowFromModel matches `\b1m\b`) and keeps the alias in
+    // the advertised set so acpx's exact-string replay gate accepts it on
+    // resume. A plain pick (no hint) is returned untouched.
+    const runModelId = effectiveRunModelId(params.modelId, modelId);
     // When the selection is the synthesized box-default entry, the literal
     // string "default" is NOT a real SDK model id — map it to the SDK's
     // documented "use the default" (`setModel(undefined)`), the same reset the
@@ -1804,8 +1812,8 @@ export class ClaudeAcpAgent implements Agent {
     // the resume-safe "default" id either way, never `undefined`.
     const isBoxDefault =
       resolved?.value === "default" || params.modelId === "" || params.modelId === "default";
-    await session.query.setModel(isBoxDefault ? undefined : modelId);
-    await this.updateConfigOption(params.sessionId, "model", modelId);
+    await session.query.setModel(isBoxDefault ? undefined : runModelId);
+    await this.updateConfigOption(params.sessionId, "model", runModelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1862,24 +1870,33 @@ export class ClaudeAcpAgent implements Agent {
     // Use the canonical option value so downstream code always receives the
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
+    // Preserve an explicit `[1m]` context hint on a model pick — same rationale
+    // as unstable_setSessionModel: the resolved option value is the stripped
+    // base ("sonnet"), so forwarding it verbatim would run 200k despite a
+    // "sonnet[1m]" request. Re-attach the hint for the value applied to the SDK
+    // and stored as currentModelId; non-model options are unaffected.
+    const appliedValue =
+      params.configId === "model"
+        ? effectiveRunModelId(params.value, resolvedValue)
+        : resolvedValue;
 
     if (params.configId === "mode") {
-      await this.applySessionMode(params.sessionId, resolvedValue);
+      await this.applySessionMode(params.sessionId, appliedValue);
       await this.client.sessionUpdate({
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "current_mode_update",
-          currentModeId: resolvedValue,
+          currentModeId: appliedValue,
         },
       });
     } else if (params.configId === "model") {
-      await this.sessions[params.sessionId].query.setModel(resolvedValue);
+      await this.sessions[params.sessionId].query.setModel(appliedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
     // the same path.
 
-    await this.applyConfigOptionValue(params.sessionId, session, params.configId, resolvedValue);
+    await this.applyConfigOptionValue(params.sessionId, session, params.configId, appliedValue);
 
     return { configOptions: session.configOptions };
   }
@@ -2166,7 +2183,9 @@ export class ClaudeAcpAgent implements Agent {
     } else if (configId === "model") {
       // Resolve the new model's `ModelInfo` once: its `description` feeds the
       // context-window heuristic below, and `supportsAutoMode` the mode clamp.
-      const newModelInfo = session.modelInfos.find((m) => m.value === value);
+      // Tolerate a `[1m]` hint on `value` that the base entry lacks (mid-session
+      // switch to "sonnet[1m]" when modelInfos holds only the base "sonnet").
+      const newModelInfo = findModelInfoById(session.modelInfos, value);
       if (session.models.currentModelId !== value) {
         // The cached context window was learned for the previous model; reset
         // to the new model's heuristic so mid-stream updates between now and
@@ -3282,8 +3301,10 @@ function buildConfigOptions(
     },
   ];
 
-  // Add effort level option based on the currently selected model
-  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
+  // Add effort level option based on the currently selected model. Tolerate a
+  // `[1m]` hint on currentModelId that the base entry lacks (a mid-session
+  // switch stores "sonnet[1m]" while modelInfos may hold only "sonnet").
+  const currentModelInfo = findModelInfoById(modelInfos, models.currentModelId);
   const supportedLevels = currentModelInfo?.supportsEffort
     ? (currentModelInfo.supportedEffortLevels ?? [])
     : [];
@@ -3412,6 +3433,42 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
   }
 
   return bestMatch;
+}
+
+/**
+ * Preserve an explicit `[1m]` (or other `[<n>m]`) context hint on the model id
+ * that is actually handed to the Claude Code binary via `query.setModel(...)`.
+ *
+ * `resolveModelPreference` matches the base `ModelInfo` for alias lookups and
+ * returns its bare `.value` ("sonnet"), dropping the `[1m]` suffix. But the
+ * binary is the authority on `[1m]`: it strips `(\[1m\])+$` itself and enables
+ * the long-context beta (`anthropic-beta: context-1m-2025-08-07`) for the base
+ * model. If we forward the stripped base, the binary runs the model at its 200k
+ * default even though the picker/label promised 1M — the exact defect this fixes.
+ *
+ * So: when the *requested* id carried a context hint, re-attach it to the
+ * resolved base (unless the base already carries one). A requested id WITHOUT a
+ * hint is returned untouched — we never fabricate long-context for a plain pick.
+ */
+function effectiveRunModelId(requested: string, resolvedBase: string): string {
+  const hint = requested.match(MODEL_CONTEXT_HINT_PATTERN)?.[1];
+  if (!hint) return resolvedBase;
+  if (MODEL_CONTEXT_HINT_PATTERN.test(resolvedBase)) return resolvedBase;
+  return `${resolvedBase}[${hint}]`;
+}
+
+/**
+ * Look up the `ModelInfo` for a stored/current model id, tolerating a `[1m]`
+ * context hint the advertised base entry does not carry. A mid-session switch
+ * stores the `[1m]` run value as `currentModelId` (so the reported window is
+ * 1M), but `session.modelInfos` may hold only the base entry (e.g. a session
+ * started on "default" then switched to "sonnet[1m]"). Fall back to the alias
+ * resolver so effort/mode gating keeps keying on the base model's capabilities.
+ */
+function findModelInfoById(modelInfos: ModelInfo[], id: string): ModelInfo | undefined {
+  return (
+    modelInfos.find((m) => m.value === id) ?? resolveModelPreference(modelInfos, id) ?? undefined
+  );
 }
 
 function resolveSettingsModel(
@@ -3626,7 +3683,13 @@ async function getAvailableModels(
     // on the exact same value (no fuzzy/alias rewrite). Unchanged from before.
     const skipSetModel = !userInputWasFuzzyMatch && sdkSawSameValue;
     if (!skipSetModel) {
-      await query.setModel(currentModel.value);
+      // Preserve an explicit `[1m]` context hint from the resolved input so a
+      // session created/resumed on a "sonnet[1m]"/"opus[1m]" pin runs the
+      // long-context beta from the start. `resolveModelPreference` strips the
+      // suffix down to the base ModelInfo; the binary re-derives it. Without
+      // this the adapter advertises 1M (via the relabel below) while the SDK
+      // silently runs the base model at 200k.
+      await query.setModel(effectiveRunModelId(resolvedFromInput, currentModel.value));
     }
   }
 
