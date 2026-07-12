@@ -3450,10 +3450,15 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
  * resolved base (unless the base already carries one). A requested id WITHOUT a
  * hint is returned untouched — we never fabricate long-context for a plain pick.
  */
-function effectiveRunModelId(requested: string, resolvedBase: string): string {
+export function effectiveRunModelId(requested: string, resolvedBase: string): string {
   const hint = requested.match(MODEL_CONTEXT_HINT_PATTERN)?.[1];
   if (!hint) return resolvedBase;
-  if (MODEL_CONTEXT_HINT_PATTERN.test(resolvedBase)) return resolvedBase;
+  // The resolved base may ALREADY denote this context tier — either bracketed
+  // ("sonnet[1m]") or as a concrete id ("claude-opus-4-6-1m"). Both forms carry
+  // the hint as a `\b<hint>\b` token; don't double-append (a doubled suffix
+  // would defeat the binary's `(\[1m\])+$` strip and inferContextWindowFromModel
+  // already matches either form). `hint` is `\d+m`, so it is regex-safe.
+  if (new RegExp(`\\b${hint}\\b`, "i").test(resolvedBase)) return resolvedBase;
   return `${resolvedBase}[${hint}]`;
 }
 
