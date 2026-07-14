@@ -166,6 +166,17 @@ export const INIT_HARD_MS = 300_000;
 export const WEDGE_DISPLAY_MS = 90_000;
 
 /**
+ * Hard cap on `session.pendingSdkMessages` (the mid-await SDK-message buffer
+ * introduced to close the `activePromptResolve` routing hole — CONCEPTION §1.1
+ * A1). The buffer only grows while the prompt loop is mid-`await` between parks,
+ * so in practice it holds a handful of messages at most. A count this large means
+ * the loop is wedged and the buffer is masking it — so overflow is a LOUD failure
+ * (stage `backgroundLoopError`, terminate the turn via the existing error path),
+ * never a silent drop (silent drop is the bug being fixed).
+ */
+export const MAX_PENDING_SDK_MESSAGES = 4096;
+
+/**
  * Opt-in, best-effort Tier-1 self-abort (CONCEPTION §4.3 Tier 1). When the env
  * var `ACP_TURN_NOACTIVITY_ABORT_MS` is set to a positive integer, a turn with
  * no delivered message for that many ms tears itself down (abort + close) and
@@ -221,6 +232,14 @@ type Session = {
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Resolve callback for the active prompt's current nextMessage() call. null when idle. */
   activePromptResolve: ((msg: SDKMessage | null) => void) | null;
+  /** SDK messages that arrived while a prompt owns the stream (`promptRunning`)
+   *  but its loop was mid-`await` (no resolver parked). The background reader
+   *  buffers them here instead of diverting them to `handleIdleMessage`, which
+   *  silently discarded turn-control messages (`session_state_changed`, user
+   *  replays) and withheld the turn's response (RCA §1.2, CONCEPTION §1.1 A1).
+   *  `nextMessage()` drains this FIFO before parking. A `null` entry is a
+   *  stream-end / error sentinel so the loop still observes termination. */
+  pendingSdkMessages: (SDKMessage | null)[];
   /** Error captured by the background reader loop, to be re-thrown by the prompt. */
   backgroundLoopError: Error | null;
   /** Context window size of the last top-level assistant model, carried across
@@ -854,12 +873,11 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.cancelled = false;
-    session.accumulatedUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    };
+    // A2 (RCA §1.3): the `accumulatedUsage` reset is NOT done here at entry.
+    // A concurrent prompt() that resets on entry — then immediately parks behind
+    // the running turn (below) — zeroes the RUNNING turn's eventual
+    // `sessionUsage(session)` response. Instead each ownership branch below resets
+    // only when this prompt actually takes the stream.
 
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
@@ -900,7 +918,24 @@ export class ClaudeAcpAgent implements Agent {
       if (cancelled) {
         return { stopReason: "cancelled" };
       }
+      // A2: reset now — the running turn has ended and this prompt is taking
+      // over the stream (handoff). Resetting at entry would have zeroed that
+      // turn's usage while we were still parked behind it.
+      session.accumulatedUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      };
     } else {
+      // Fresh turn taking the stream immediately: reset before pushing so no
+      // concurrently-read result can be zeroed after it is counted.
+      session.accumulatedUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      };
       session.input.push(userMessage);
     }
 
@@ -918,11 +953,19 @@ export class ClaudeAcpAgent implements Agent {
     let lastThinkingTokensAt = 0;
     let lastThinkingTokensValue = -1;
 
-    /** Waits for the background reader loop to deliver the next SDK message. */
-    const nextMessage = (): Promise<SDKMessage | null> =>
-      new Promise((resolve) => {
+    /** Waits for the background reader loop to deliver the next SDK message.
+     *  Drains any messages the reader buffered while this loop was mid-`await`
+     *  (A1) before parking. FIFO is structurally guaranteed: the reader only
+     *  buffers when no resolver is parked, and this loop never parks while the
+     *  buffer is non-empty — single event loop, no interleaving window. */
+    const nextMessage = (): Promise<SDKMessage | null> => {
+      if (session.pendingSdkMessages.length > 0) {
+        return Promise.resolve(session.pendingSdkMessages.shift() ?? null);
+      }
+      return new Promise((resolve) => {
         session.activePromptResolve = resolve;
       });
+    };
 
     // Turn no-activity surfacing (CONCEPTION §3) + optional Tier-1 self-abort
     // (§4.3). Reset on every delivered message; if WEDGE_DISPLAY_MS elapses with
@@ -1694,26 +1737,67 @@ export class ClaudeAcpAgent implements Agent {
       session.activePromptResolve = null;
 
       if (!handedOff) {
-        session.promptRunning = false;
         if (errored) {
-          // The query stream was just drained — handing pending prompts off
-          // onto it would let them race with the recovery. Cancel them so
-          // each waiting prompt() returns stopReason: "cancelled" and the
-          // client can decide whether to retry.
+          session.promptRunning = false;
+          // The query stream was just drained — handing pending prompts or
+          // buffered messages off onto it would let them race with the recovery.
+          // Discard the buffer and cancel the pendings so each waiting prompt()
+          // returns stopReason: "cancelled" and the client can decide to retry.
+          session.pendingSdkMessages.length = 0;
           for (const pending of session.pendingMessages.values()) {
             pending.resolve(true);
           }
           session.pendingMessages.clear();
-        } else if (session.pendingMessages.size > 0) {
-          // This usually should not happen, but in case the loop finishes
-          // without claude sending all message replays, we resolve the
-          // next pending prompt call to ensure no prompts get stuck.
-          const next = [...session.pendingMessages.entries()].sort(
-            (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
+        } else {
+          // Clean exit (idle-status return, or stream end without error). Drain
+          // any messages the reader buffered after the loop stopped parking (A1
+          // lifecycle rule): a buffered user-replay whose uuid matches a parked
+          // prompt hands the stream to that prompt (same as the mid-loop handoff
+          // at :1517) and leaves the rest of the buffer for its successor;
+          // anything else is a genuine inter-turn update routed to idle handling.
+          let drainedHandoff = false;
+          while (session.pendingSdkMessages.length > 0) {
+            const buffered = session.pendingSdkMessages.shift();
+            if (!buffered) continue; // null sentinel — stream end, nothing to route
+            if (
+              buffered.type === "user" &&
+              "uuid" in buffered &&
+              buffered.uuid &&
+              session.pendingMessages.has(buffered.uuid as string)
+            ) {
+              const uuid = buffered.uuid as string;
+              const pending = session.pendingMessages.get(uuid)!;
+              pending.resolve(false);
+              session.pendingMessages.delete(uuid);
+              handedOff = true;
+              drainedHandoff = true;
+              break; // successor prompt owns the stream + remaining buffer
+            }
+            if (
+              session.emitRawSDKMessages &&
+              shouldEmitRawMessage(session.emitRawSDKMessages, buffered)
+            ) {
+              await this.client.extNotification("_claude/sdkMessage", {
+                sessionId: params.sessionId,
+                message: buffered as Record<string, unknown>,
+              });
+            }
+            await this.handleIdleMessage(buffered, params.sessionId);
+          }
+          if (!drainedHandoff) {
+            session.promptRunning = false;
+            // Last-resort band-aid retained: if the loop finished without the
+            // SDK replaying a still-parked prompt's message, release the oldest
+            // so it doesn't get stuck.
+            if (session.pendingMessages.size > 0) {
+              const next = [...session.pendingMessages.entries()].sort(
+                (a, b) => a[1].order - b[1].order,
+              )[0];
+              if (next) {
+                next[1].resolve(false);
+                session.pendingMessages.delete(next[0]);
+              }
+            }
           }
         }
       }
@@ -1730,6 +1814,10 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
+    // Discard any buffered mid-await SDK messages (A1 lifecycle rule): cancel
+    // throws away in-flight turn state, mirroring the query.interrupt() stale
+    // stream-drain below. teardownSession() reaches this via cancel() too.
+    session.pendingSdkMessages.length = 0;
     // Cancel hygiene (CONCEPTION §4.6): also unblock the ACTIVE prompt loop's
     // pending `nextMessage()` so it observes `cancelled`, returns
     // `{stopReason:'cancelled'}`, and clears `promptRunning` in its finally.
@@ -2840,6 +2928,7 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId, currentModelInfo?.description) ??
@@ -2877,6 +2966,10 @@ export class ClaudeAcpAgent implements Agent {
               const resolve = session.activePromptResolve;
               session.activePromptResolve = null;
               resolve(null);
+            } else if (session.promptRunning) {
+              // Loop owns the stream but is mid-await: queue a null sentinel so
+              // its next park observes stream end (A1).
+              session.pendingSdkMessages.push(null);
             }
             break;
           }
@@ -2886,8 +2979,31 @@ export class ClaudeAcpAgent implements Agent {
             const resolve = session.activePromptResolve;
             session.activePromptResolve = null;
             resolve(value);
+          } else if (session.promptRunning) {
+            // A1: a prompt owns the stream but its loop is mid-await (no resolver
+            // parked). Buffer instead of routing to handleIdleMessage — which
+            // silently discarded turn-control messages and withheld the response
+            // (RCA §1.2). nextMessage() drains this at the next park. Buffer ALL
+            // message types: classification is where bugs live, and a buffered
+            // content chunk is simply processed milliseconds later, exactly as a
+            // parked-path delivery would be.
+            if (!session.backgroundLoopError) {
+              if (session.pendingSdkMessages.length >= MAX_PENDING_SDK_MESSAGES) {
+                // Overflow ⇒ the loop is wedged and the buffer is masking it.
+                // Loud failure: stage the error and queue a null sentinel so the
+                // loop terminates the turn through the existing error path.
+                session.backgroundLoopError = new Error(
+                  `Session ${sessionId}: buffered SDK message count exceeded ` +
+                    `${MAX_PENDING_SDK_MESSAGES}; terminating the turn instead of ` +
+                    `dropping messages.`,
+                );
+                session.pendingSdkMessages.push(null);
+              } else {
+                session.pendingSdkMessages.push(value);
+              }
+            }
           } else {
-            // Idle: emit raw SDK message if configured, then forward.
+            // Genuine inter-turn (idle) message: emit raw if configured, then forward.
             if (
               session.emitRawSDKMessages &&
               shouldEmitRawMessage(session.emitRawSDKMessages, value)
@@ -2907,6 +3023,10 @@ export class ClaudeAcpAgent implements Agent {
           const resolve = session.activePromptResolve;
           session.activePromptResolve = null;
           resolve(null);
+        } else if (session.promptRunning) {
+          // Loop is mid-await: queue a null sentinel so its next park returns
+          // null and re-throws backgroundLoopError (A1).
+          session.pendingSdkMessages.push(null);
         }
       }
     };
