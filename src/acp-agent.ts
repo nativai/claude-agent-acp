@@ -1769,9 +1769,10 @@ export class ClaudeAcpAgent implements Agent {
               const pending = session.pendingMessages.get(uuid)!;
               pending.resolve(false);
               session.pendingMessages.delete(uuid);
-              handedOff = true;
+              // `drainedHandoff` (not `handedOff`) gates the promptRunning
+              // clear below; the successor keeps ownership + the remaining buffer.
               drainedHandoff = true;
-              break; // successor prompt owns the stream + remaining buffer
+              break;
             }
             if (
               session.emitRawSDKMessages &&
