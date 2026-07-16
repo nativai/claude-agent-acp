@@ -2296,6 +2296,12 @@ describe("inferContextWindowFromModel", () => {
     expect(inferContextWindowFromModel("opus[1m]", "Opus 1M context")).toBe(1_000_000);
   });
 
+  it("infers 1M for the injected Fable description", () => {
+    // injectFableModel sets description: "Fable (1M context)"; the model id
+    // "fable" has no `\b1m\b` token, so the description is the only signal.
+    expect(inferContextWindowFromModel("fable", "Fable (1M context)")).toBe(1_000_000);
+  });
+
   it("keeps plain `opus` (Opus 4.8) at the default 200k window", () => {
     // The crux of W13-12: `opus` and `default` are both Opus 4.8 with the same
     // base id; only `default`'s description mentions 1M, so `opus` must NOT be

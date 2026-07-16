@@ -3658,7 +3658,7 @@ function injectFableModel(
   const fableInfo: ModelInfo = {
     value: FABLE_MODEL_ID,
     displayName: "Fable",
-    description: "Fable",
+    description: "Fable (1M context)",
   };
   return {
     state: {
