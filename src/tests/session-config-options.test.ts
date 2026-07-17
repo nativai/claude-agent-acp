@@ -446,7 +446,7 @@ describe("session config options", () => {
         (o: any) => o.id === "effort",
       );
       expect(effortOption).toBeUndefined();
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("clamps effort in config_option_update when new model has different supported levels", async () => {
@@ -485,7 +485,7 @@ describe("session config options", () => {
       );
       expect(effortOption).toBeDefined();
       expect(effortOption.currentValue).toBe("default");
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("preserves effort in config_option_update when new model supports same level", async () => {
@@ -555,7 +555,58 @@ describe("session config options", () => {
         value: "low",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "low" });
+      // The pinned effort now rides the FLAG-tier `env` block (authoritative,
+      // beats the box's re-applied user-tier CLAUDE_CODE_EFFORT_LEVEL); the
+      // effortLevel key is kept coherent for in-union values. (brick 5f35da58)
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "low" },
+        effortLevel: "low",
+      });
+    });
+
+    it("routes an out-of-union 'max' pin through the env path only (no effortLevel key)", async () => {
+      // Arrange: make "max" a selectable effort level for this session.
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      effortOpt.options.push({ value: "max", name: "Max" });
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "max",
+      });
+
+      // "max" is outside the SDK `effortLevel` union, so it must ride ONLY the
+      // authoritative env path — the effortLevel key is omitted, never set to a
+      // bogus out-of-union "max". This is precisely what makes a
+      // `--reasoning-effort max` pin win over the box's user-tier
+      // CLAUDE_CODE_EFFORT_LEVEL=high (the hostile ambient env is exercised
+      // end-to-end in the self-test). (brick 5f35da58)
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+      });
+      const calls = applyFlagSettingsSpy.mock.calls;
+      const lastCall = calls[calls.length - 1]?.[0];
+      expect(lastCall).not.toHaveProperty("effortLevel");
+    });
+
+    it("sets both env and effortLevel for an in-union 'xhigh' pin", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      effortOpt.options.push({ value: "xhigh", name: "Extra High" });
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "xhigh",
+      });
+
+      // "xhigh" is in the SDK union, so both channels are set: the env block
+      // (authoritative) and the effortLevel key (label/clamp coherence).
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "xhigh" },
+        effortLevel: "xhigh",
+      });
     });
 
     it("calls applyFlagSettings with null effortLevel for 'default'", async () => {
@@ -570,7 +621,7 @@ describe("session config options", () => {
         value: "default",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
 
       // The SDK's applyFlagSettings travels over a JSON pipe and only clears a
       // flag-layer key when an explicit `null` is sent — `undefined` is
@@ -689,7 +740,7 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("adds effort option when switching to a model that supports effort", async () => {
@@ -760,7 +811,7 @@ describe("session config options", () => {
       // "max" is not in sonnet's levels, so should fall back to "default" (no effort override)
       expect(effortOption?.currentValue).toBe("default");
       // SDK should be told to clear the effort override
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("preserves effort value when new model supports the same level", async () => {

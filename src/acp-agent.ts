@@ -2332,9 +2332,7 @@ export class ClaudeAcpAgent implements Agent {
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(newEffort),
-        });
+        await applyEffortToSdk(session.query, newEffort);
       }
 
       // Emit current_mode_update only after session.modes AND
@@ -2357,9 +2355,7 @@ export class ClaudeAcpAgent implements Agent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
       if (configId === "effort") {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(value),
-        });
+        await applyEffortToSdk(session.query, value);
       }
     }
   }
@@ -2626,6 +2622,27 @@ export class ClaudeAcpAgent implements Agent {
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
+    // Resolve a concrete, non-"default" effort pin known at creation. Injecting
+    // it as a FLAG-tier `env` block (via the creation `settings` option below)
+    // makes the pin win from TURN 1 — otherwise the box's user-tier
+    // `CLAUDE_CODE_EFFORT_LEVEL` env would beat it on the first turn (the
+    // runtime `applyEffortToSdk` only lands from the turn it is applied). See
+    // `applyEffortToSdk` / brick 5f35da58. Pin-gated: unset when unpinned.
+    // `effortLevel` from resolved settings is the SDK union or undefined (never
+    // "default"/"max"), so any string here is a concrete pin.
+    const pinnedEffort = settingsManager.getSettings().effortLevel;
+    const effortEnv = pinnedEffort ? { CLAUDE_CODE_EFFORT_LEVEL: pinnedEffort } : undefined;
+    // Merge the modelConfig-derived settings and the effort-pin `env` into a
+    // single flag-tier `settings` object so the two don't clobber each other
+    // (both live under the one `settings` key). Applied only when the caller
+    // didn't supply its own `settings` via _meta — the caller keeps full
+    // control, matching the modelConfig precedence rule.
+    const creationSettings: Settings = {};
+    if (modelConfig?.modelOverrides) creationSettings.modelOverrides = modelConfig.modelOverrides;
+    if (modelConfig?.availableModels)
+      creationSettings.availableModels = modelConfig.availableModels;
+    if (effortEnv) creationSettings.env = effortEnv;
+
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
 
@@ -2649,17 +2666,13 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
-      // CLAUDE_MODEL_CONFIG env var is a fallback for model
-      // configuration (e.g. Bedrock model ID overrides). When the caller
-      // provides settings via _meta, we intentionally ignore the env var —
-      // the caller is assumed to have full control over model configuration.
+      // CLAUDE_MODEL_CONFIG env var is a fallback for model configuration
+      // (e.g. Bedrock model ID overrides), and the effort-pin `env` block makes
+      // a pinned reasoning effort win from turn 1 (see `creationSettings`).
+      // When the caller provides settings via _meta, we intentionally ignore
+      // both — the caller is assumed to have full control over configuration.
       ...(!userProvidedOptions?.settings &&
-        modelConfig && {
-          settings: {
-            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
-            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
-          },
-        }),
+        Object.keys(creationSettings).length > 0 && { settings: creationSettings }),
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
@@ -2894,16 +2907,18 @@ export class ClaudeAcpAgent implements Agent {
       settingsManager.getSettings().effortLevel,
     );
 
-    // Apply the initial effort level to the SDK so it matches the UI default
+    // Apply the initial effort level to the SDK so it matches the UI default.
+    // Pin-gated: only when a concrete, non-"default" effort is resolved at
+    // creation — unpinned sessions are left untouched so the box default
+    // governs. The creation `settings.env` below is the belt-and-suspenders
+    // for turn 1; this runtime apply covers the flag layer authoritatively.
     const initialEffort = configOptions.find((o) => o.id === "effort");
     if (
       initialEffort &&
       typeof initialEffort.currentValue === "string" &&
       initialEffort.currentValue !== "default"
     ) {
-      await q.applyFlagSettings({
-        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
-      });
+      await applyEffortToSdk(q, initialEffort.currentValue);
     }
 
     this.sessions[sessionId] = {
@@ -3377,14 +3392,43 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
   return modes;
 }
 
-// Translate a UI effort value into the flag-layer payload. The SDK
-// shallow-merges `applyFlagSettings`, drops `undefined` during JSON transport,
-// and only clears a key when an explicit `null` is sent — see
-// `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
-// `"default"` sentinel and `undefined` (effort option absent for the model) to
-// `null` ensures any previously-applied flag is actually cleared.
-function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | null {
-  return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
+// Values the SDK `effortLevel` union can express. It notably omits "max" (an
+// acpx effort level), which is one reason the env path below is authoritative.
+function isSdkEffortLevel(value: string): value is "low" | "medium" | "high" | "xhigh" {
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
+
+// Apply a session's reasoning-effort pin so it actually wins at the harness.
+//
+// The box user settings inject `CLAUDE_CODE_EFFORT_LEVEL` via the settings `env`
+// block, and the harness re-applies that `env` block to its process env EVERY
+// turn. That env var is the TOP effort authority — above the flag-tier
+// `effortLevel` KEY — so a session's effort pin silently loses to the box
+// default (`high`) unless we fight env with env at a higher tier. We inject the
+// pin as a FLAG-tier `env` block (the highest user-controlled settings tier),
+// which overrides the user-tier env in the per-turn re-application. The env path
+// also accepts "max", which the SDK `effortLevel` union omits. (brick 5f35da58)
+//
+// `applyFlagSettings` shallow-merges top-level keys; `null` clears a key from
+// the flag layer, while `undefined` is dropped during JSON transport and has no
+// effect — so the no-pin path sends explicit `null`s to actually clear.
+async function applyEffortToSdk(query: Query, value: string | undefined): Promise<void> {
+  if (value === undefined || value === "default") {
+    // Unpinned / default: clear both the flag-layer env override and the
+    // effortLevel key so the box/user settings default keeps governing. `env`
+    // is a single top-level flag key and the adapter sets no other flag-env
+    // keys, so clearing the whole key is exact; read-modify-write if that ever
+    // changes.
+    await query.applyFlagSettings({ env: null, effortLevel: null });
+    return;
+  }
+  await query.applyFlagSettings({
+    // Authoritative: beats the re-applied user-tier env, and accepts "max".
+    env: { CLAUDE_CODE_EFFORT_LEVEL: value },
+    // Keep the effortLevel key coherent for label/clamp paths, but only for
+    // values the SDK union can express (it omits "max").
+    ...(isSdkEffortLevel(value) && { effortLevel: value }),
+  });
 }
 
 function buildConfigOptions(
