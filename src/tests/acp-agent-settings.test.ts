@@ -559,7 +559,12 @@ describe("ClaudeAcpAgent settings", () => {
       const modelOption = response.configOptions.find((o: any) => o.id === "model");
       // No allowlist → SDK list passes through unchanged, then `fable` is
       // appended additively (see `injectFableModel`).
-      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default", "haiku", "fable", "opus"]);
+      expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "default",
+        "haiku",
+        "fable",
+        "opus",
+      ]);
     });
 
     it("advertises fable additively and idempotently on every init", async () => {
