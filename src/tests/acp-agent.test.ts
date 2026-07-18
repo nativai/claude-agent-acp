@@ -2909,6 +2909,44 @@ describe("usage_update computation", () => {
     expect(session.contextWindowSize).toBe(200000);
   });
 
+  it("switching to the restored-hint model re-applies the restored 1M window (fix A model-aware)", async () => {
+    // Brick 92a994a0: the reported bug's real cause. On resume the adapter
+    // seeded 1M for `opus` from the round-tripped hint, but advertises the box
+    // `default` first; acpx then replays the pinned `opus`. Without the
+    // model-aware restore, that switch resets to opus's heuristic (200k),
+    // clobbering the restored 1M before the first post-resume usage_update.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [
+      { value: "default", displayName: "Default", description: "Opus 4.8 with 1M context" },
+      { value: "opus", displayName: "Opus", description: "Opus 4.8" },
+    ];
+    session.restoredContextWindow = { size: 1000000, modelId: "opus" };
+    session.contextWindowSize = 1000000;
+    session.models = { currentModelId: "default", availableModels: [] } as any;
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "opus");
+    // Restored (not the 200k opus heuristic) because the switch lands on the
+    // hint's tagged model.
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("switching to a model that is NOT the restored one falls back to the heuristic (fix A)", async () => {
+    // The restored window is model-scoped: switching to a different model must
+    // not carry it forward — the heuristic governs the new model.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [{ value: "sonnet", displayName: "Sonnet", description: "Balanced" }];
+    session.restoredContextWindow = { size: 1000000, modelId: "opus" };
+    session.contextWindowSize = 1000000;
+    session.models = { currentModelId: "opus", availableModels: [] } as any;
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "sonnet");
+    expect(session.contextWindowSize).toBe(200000);
+  });
+
   it("result with no matching modelUsage preserves the learned window", async () => {
     // A turn whose `result.modelUsage` doesn't contain the current top-level
     // model (e.g. no top-level assistant message, or only a subagent ran) must

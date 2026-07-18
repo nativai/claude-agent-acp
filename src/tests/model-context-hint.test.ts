@@ -341,4 +341,44 @@ describe("context window hint restoration on resume (fix A)", () => {
     });
     expect(windowFor(sessionId)).toBe(1_000_000);
   });
+
+  it("stores the restored window tagged with its model so the replay switch can re-apply it", async () => {
+    // Model-aware restore: the hint+model are captured on the session so that
+    // when a resume replays the pinned model (after advertising `default`),
+    // the model-switch branch re-applies the restored window instead of the
+    // plain-alias heuristic. Without the model tag, that replay clobbers 1M.
+    const { sessionId } = await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: {
+        claudeCode: { contextWindowSizeHint: 1_000_000, contextWindowSizeHintModel: "opus" },
+      },
+    });
+    const restored = (
+      agent as unknown as {
+        sessions: Record<
+          string,
+          { restoredContextWindow: { size: number; modelId: string } | null }
+        >;
+      }
+    ).sessions[sessionId].restoredContextWindow;
+    expect(restored).toEqual({ size: 1_000_000, modelId: "opus" });
+  });
+
+  it("does not store a restored window when the hint has no model tag", async () => {
+    const { sessionId } = await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+    });
+    const restored = (
+      agent as unknown as {
+        sessions: Record<
+          string,
+          { restoredContextWindow: { size: number; modelId: string } | null }
+        >;
+      }
+    ).sessions[sessionId].restoredContextWindow;
+    expect(restored).toBeNull();
+  });
 });

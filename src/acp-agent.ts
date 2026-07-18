@@ -250,6 +250,14 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW; refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Fix A (brick 92a994a0): an authoritative context window restored from a
+   *  prior run (via `contextWindowSizeHint`), tagged with the model it belongs
+   *  to. A resume can advertise one model (e.g. the box `default`) and then
+   *  replay the session's pinned model; when that switch lands on `modelId`,
+   *  the model-switch branch re-applies `size` here instead of resetting to the
+   *  plain-alias heuristic (which would clobber a restored 1M back to 200k).
+   *  Absent/`null` when nothing was restored. */
+  restoredContextWindow?: { size: number; modelId: string } | null;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
@@ -324,6 +332,15 @@ export type NewSessionMeta = {
      * heuristic when a positive value is supplied. See `createSession`.
      */
     contextWindowSizeHint?: number;
+    /**
+     * The model id `contextWindowSizeHint` was learned for. Because a resume
+     * can advertise a different model first (e.g. the box `default`) and then
+     * replay the session's pinned model, the restored window must be tagged
+     * with its model so the model-switch reset re-applies it (instead of the
+     * heuristic) when the session settles on that model. Without this, the
+     * replay clobbers the restored 1M back to the plain-alias heuristic (200k).
+     */
+    contextWindowSizeHintModel?: string;
   };
   additionalRoots?: string[];
 };
@@ -2290,12 +2307,18 @@ export class ClaudeAcpAgent implements Agent {
       const newModelInfo = findModelInfoById(session.modelInfos, value);
       if (session.models.currentModelId !== value) {
         // The cached context window was learned for the previous model; reset
-        // to the new model's heuristic so mid-stream updates between now and
-        // the next `result` reflect the user's selection instead of the old
-        // model's window. Pass the description so the 1M-context `default`
-        // model is told apart from plain `opus` (they share a base model id).
+        // to the new model's window. If we have an authoritative window
+        // restored from a prior run (fix A) FOR THIS model, use it — a resume
+        // advertises one model then replays the pinned one, and without this
+        // the switch would clobber the restored 1M back to the plain-alias
+        // heuristic (200k). Otherwise fall back to the heuristic (passing the
+        // description so the 1M-context `default` is told apart from plain
+        // `opus`, which share a base model id), else DEFAULT.
         session.contextWindowSize =
-          inferContextWindowFromModel(value, newModelInfo?.description) ?? DEFAULT_CONTEXT_WINDOW;
+          session.restoredContextWindow?.modelId === value
+            ? session.restoredContextWindow.size
+            : (inferContextWindowFromModel(value, newModelInfo?.description) ??
+              DEFAULT_CONTEXT_WINDOW);
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -2639,6 +2662,17 @@ export class ClaudeAcpAgent implements Agent {
       contextWindowHint > 0
         ? contextWindowHint
         : null;
+    // The model the hint was learned for (fix A, model-aware): a resume may
+    // advertise a different model first and then replay the pinned one; tagging
+    // the restored window lets the model-switch branch re-apply it instead of
+    // clobbering it with the plain-alias heuristic.
+    const contextWindowHintModel = sessionMeta?.claudeCode?.contextWindowSizeHintModel;
+    const restoredContextWindow =
+      restoredContextWindowHint !== null &&
+      typeof contextWindowHintModel === "string" &&
+      contextWindowHintModel.length > 0
+        ? { size: restoredContextWindowHint, modelId: contextWindowHintModel }
+        : null;
 
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
@@ -2981,6 +3015,7 @@ export class ClaudeAcpAgent implements Agent {
         restoredContextWindowHint ??
         inferContextWindowFromModel(models.currentModelId, currentModelInfo?.description) ??
         DEFAULT_CONTEXT_WINDOW,
+      restoredContextWindow,
       taskState,
     };
 
