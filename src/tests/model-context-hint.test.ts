@@ -16,11 +16,45 @@ const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
 }));
 
+// Mutable init-model list the mocked SDK `query` reports, so the resume-hint
+// tests below can vary the session's model (and thus what the context-window
+// heuristic would infer) without touching the injected-session tests above.
+const { sdkInitModels } = vi.hoisted(() => ({
+  sdkInitModels: {
+    current: [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+      },
+    ] as unknown[],
+  },
+}));
+
 vi.mock("../tools.js", async () => {
   const actual = await vi.importActual<typeof import("../tools.js")>("../tools.js");
   return {
     ...actual,
     registerHookCallback: registerHookCallbackSpy,
+  };
+});
+
+// Stub the Claude Agent SDK `query` so `newSession` (→ shared `createSession`,
+// the same seed path `loadSession`/resume uses) runs without a real subprocess.
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
+  const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+    "@anthropic-ai/claude-agent-sdk",
+  );
+  return {
+    ...actual,
+    query: () => ({
+      initializationResult: async () => ({ models: sdkInitModels.current }),
+      setModel: async () => {},
+      setPermissionMode: async () => {},
+      supportedCommands: async () => [],
+      [Symbol.asyncIterator]: async function* () {},
+    }),
   };
 });
 
@@ -219,5 +253,92 @@ describe("1M context hint preservation (integration)", () => {
       expect(session().models.currentModelId).toBe("sonnet");
       expect(session().contextWindowSize).toBe(200000);
     });
+  });
+});
+
+// Fix A (brick 92a994a0): a resumed session must restore the authoritative
+// context window a prior run already learned, instead of re-running the
+// heuristic and re-guessing 200k. acpx remembers the last authoritative `size`
+// per session-model and passes it back on resume as
+// `_meta.claudeCode.contextWindowSizeHint`; `createSession` (shared by
+// newSession and loadSession/resume) seeds `contextWindowSize` from it, taking
+// precedence over the heuristic. This is the true-source fix for the reported
+// recurrence (a genuine 1M `opus` resume flashing ~172k/200k for its whole
+// first post-resume turn).
+describe("context window hint restoration on resume (fix A)", () => {
+  let agent: ClaudeAcpAgentType;
+  let ClaudeAcpAgent: typeof ClaudeAcpAgentType;
+
+  function createMockClient(): AgentSideConnection {
+    return {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+    } as unknown as AgentSideConnection;
+  }
+
+  function windowFor(sessionId: string): number {
+    return (agent as unknown as { sessions: Record<string, { contextWindowSize: number }> })
+      .sessions[sessionId].contextWindowSize;
+  }
+
+  beforeEach(async () => {
+    registerHookCallbackSpy.mockClear();
+    // Default to a plain 200k-heuristic model so the hint is the only thing
+    // that can lift the window to 1M.
+    sdkInitModels.current = [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+      },
+    ];
+    vi.resetModules();
+    const acpAgent = await import("../acp-agent.js");
+    ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
+    agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  it("seeds contextWindowSize from the restored hint even though the model heuristic would guess 200k", async () => {
+    const { sessionId } = await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+    });
+    // Without fix A this would be 200000 (the heuristic's guess for sonnet) —
+    // exactly the wrong number the reported session showed post-resume.
+    expect(windowFor(sessionId)).toBe(1_000_000);
+  });
+
+  it("without a hint, the same 200k-heuristic model falls back to the default window", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/test", mcpServers: [] });
+    expect(windowFor(sessionId)).toBe(200000);
+  });
+
+  it("ignores a non-positive or non-finite hint and falls back to the heuristic default", async () => {
+    for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { sessionId } = await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { claudeCode: { contextWindowSizeHint: bad } },
+      });
+      expect(windowFor(sessionId)).toBe(200000);
+    }
+  });
+
+  it("hint takes precedence over (and is consistent with) a positive 1M heuristic — idempotent restore", async () => {
+    // The box-default `default` model already infers 1M from its description;
+    // restoring the same 1M hint must not regress it.
+    sdkInitModels.current = [
+      { value: "default", displayName: "Default", description: "Opus 4.8 with 1M context" },
+    ];
+    const { sessionId } = await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: { claudeCode: { contextWindowSizeHint: 1_000_000 } },
+    });
+    expect(windowFor(sessionId)).toBe(1_000_000);
   });
 });

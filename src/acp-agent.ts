@@ -244,8 +244,10 @@ type Session = {
   backgroundLoopError: Error | null;
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Defaults to
-   *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
+   *  before the turn's first result message arrives. Seeded (in precedence
+   *  order) from a restored `contextWindowSizeHint` on resume (fix A), the
+   *  positive heuristic (`inferContextWindowFromModel`), else
+   *  DEFAULT_CONTEXT_WINDOW; refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
@@ -311,6 +313,17 @@ export type NewSessionMeta = {
      * - SDKMessageFilter[]: emit only messages matching at least one filter
      */
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
+    /**
+     * Authoritative context-window size (in tokens) that a previous run of
+     * this session already learned from the SDK's `result.modelUsage`, passed
+     * back in on resume so the restored session reports the correct window
+     * from its first mid-stream `usage_update` instead of re-guessing from the
+     * heuristic. The window is a stable property of (model, account); the
+     * caller (acpx) remembers the last authoritative value per session-model
+     * and invalidates it on a model change. Takes precedence over the
+     * heuristic when a positive value is supplied. See `createSession`.
+     */
+    contextWindowSizeHint?: number;
   };
   additionalRoots?: string[];
 };
@@ -2614,6 +2627,19 @@ export class ClaudeAcpAgent implements Agent {
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
+    // Fix A (resume): an authoritative context window learned by a prior run
+    // of this session, round-tripped back in by acpx so a restored session
+    // reports the correct window from its first mid-stream update instead of
+    // re-guessing. Guard to a positive finite number; a bad/zero hint is
+    // ignored and we fall back to the heuristic.
+    const contextWindowHint = sessionMeta?.claudeCode?.contextWindowSizeHint;
+    const restoredContextWindowHint =
+      typeof contextWindowHint === "number" &&
+      Number.isFinite(contextWindowHint) &&
+      contextWindowHint > 0
+        ? contextWindowHint
+        : null;
+
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
@@ -2946,7 +2972,13 @@ export class ClaudeAcpAgent implements Agent {
       activePromptResolve: null,
       pendingSdkMessages: [],
       backgroundLoopError: null,
+      // Precedence: an authoritative window restored from a prior run of this
+      // session (fix A — acpx round-trips the last learned window on resume) >
+      // the positive heuristic (`[1m]`/`default`/`fable`) > DEFAULT. This is
+      // what makes a resumed 1M session report 1M from its first post-resume
+      // usage_update instead of re-guessing 200k.
       contextWindowSize:
+        restoredContextWindowHint ??
         inferContextWindowFromModel(models.currentModelId, currentModelInfo?.description) ??
         DEFAULT_CONTEXT_WINDOW,
       taskState,
