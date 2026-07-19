@@ -1758,6 +1758,13 @@ export class ClaudeAcpAgent implements Agent {
           "The Claude Agent process exited unexpectedly. Please start a new session.",
         );
       }
+      // Attach a machine `errorKind` when the thrown error is recognisably a
+      // quota, billing, or auth failure so ACP clients (e.g. acpx failover)
+      // can dispatch without falling back to string matching.
+      const thrownKind = errorKindFromThrown(error);
+      if (thrownKind !== undefined) {
+        throw RequestError.internalError({ errorKind: thrownKind }, error.message);
+      }
       throw error;
     } finally {
       // Stop the turn no-activity timer for this prompt.
@@ -3360,6 +3367,79 @@ function errorKindData(
   errorKind: SDKAssistantMessageError | undefined,
 ): { errorKind: SDKAssistantMessageError } | undefined {
   return errorKind ? { errorKind } : undefined;
+}
+
+/**
+ * Classify a thrown (non-streamed) error into a categorical `errorKind` so
+ * ACP clients can dispatch on a machine signal without falling back to
+ * string matching.  This is the send-failure / thrown-query counterpart of
+ * `errorKindData`, which handles the streamed `SDKAssistantMessage.error`
+ * path.
+ *
+ * The SDK does not surface `SDKAssistantMessageError` on the thrown path;
+ * classification is a best-effort heuristic using the typed fields present
+ * on `@anthropic-ai/sdk` `APIError` subclasses (`type`, `status`) with a
+ * message-text fallback for errors forwarded as plain Error instances.
+ */
+function errorKindFromThrown(error: Error): SDKAssistantMessageError | undefined {
+  // APIError subclasses carry a `type` string from the JSON error body.
+  const errWithFields = error as { type?: unknown; status?: unknown };
+  if (typeof errWithFields.type === "string") {
+    switch (errWithFields.type) {
+      case "rate_limit_error":
+        return "rate_limit";
+      case "authentication_error":
+      case "permission_error":
+        return "authentication_failed";
+      case "billing_error":
+        return "billing_error";
+      case "overloaded_error":
+        return "overloaded";
+      case "invalid_request_error":
+        return "invalid_request";
+      case "api_error":
+      case "timeout_error":
+        return "server_error";
+    }
+  }
+
+  // HTTP status fallback for API errors whose body type field is absent.
+  if (typeof errWithFields.status === "number") {
+    if (errWithFields.status === 429) return "rate_limit";
+    if (errWithFields.status === 401 || errWithFields.status === 403)
+      return "authentication_failed";
+    if (errWithFields.status >= 500) return "server_error";
+  }
+
+  // Message-based heuristic for subscription/billing phrasings forwarded as
+  // plain Error instances (e.g. "You've hit your monthly spend limit").
+  const lower = error.message.toLowerCase();
+  if (
+    /\b429\b/.test(error.message) ||
+    lower.includes("rate limit") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("usage limit") ||
+    lower.includes("session limit") ||
+    lower.includes("weekly limit") ||
+    lower.includes("monthly limit") ||
+    lower.includes("spend limit") ||
+    lower.includes("out of usage") ||
+    /hit your\b[\s\S]*\blimit/.test(lower)
+  ) {
+    return "rate_limit";
+  }
+  if (
+    lower.includes("credit balance") ||
+    lower.includes("insufficient credit") ||
+    lower.includes("billing")
+  ) {
+    return "billing_error";
+  }
+  if (lower.includes("authentication failed") || lower.includes("invalid api key")) {
+    return "authentication_failed";
+  }
+
+  return undefined;
 }
 
 /** Project a nullable API usage object into our non-null snapshot shape.
