@@ -1474,4 +1474,159 @@ describe("session config options", () => {
       expect(afterLow.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
     });
   });
+
+  // ── Brick c1cde4bd ──────────────────────────────────────────────────────────
+  // On session/resume the adapter transiently has currentModelId = box-default
+  // (non-effort-capable) while acpx fires set_config_option{effort} BEFORE
+  // set_model(fable) settles.  buildConfigOptions produces no effort entry →
+  // the lookup at acp-agent.ts:1959 returns undefined → line 1961 throws
+  // "Unknown config option: effort".  The tolerance guard must intercept this
+  // case and accept the effort op regardless of the transient model state.
+  describe("effort on resume — tolerance guard (brick c1cde4bd)", () => {
+    function populateResumeSession({
+      withEffortCapableModelInfo,
+    }: {
+      withEffortCapableModelInfo: boolean;
+    }) {
+      setPermissionModeSpy = vi.fn();
+      setModelSpy = vi.fn();
+      applyFlagSettingsSpy = vi.fn();
+
+      const sonnetInfo: ModelInfo = {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Balanced",
+        supportsEffort: false,
+      };
+      const fableInfo: ModelInfo = {
+        value: "fable",
+        displayName: "Claude Fable 5",
+        description: "Most capable",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+      };
+
+      // configOptions WITHOUT an effort entry — this is the transient state:
+      // currentModelId is the non-effort-capable box-default at resume time.
+      const configOptionsNoEffort = [
+        {
+          id: "mode",
+          name: "Mode",
+          type: "select",
+          category: "mode",
+          currentValue: "default",
+          options: MOCK_MODES.availableModes.map((m) => ({
+            value: m.id,
+            name: m.name,
+            description: m.description,
+          })),
+        },
+        {
+          id: "model",
+          name: "Model",
+          type: "select",
+          category: "model",
+          currentValue: "claude-sonnet-4-6",
+          options: [
+            { value: "claude-sonnet-4-6", name: "Claude Sonnet", description: "Balanced" },
+            { value: "fable", name: "Claude Fable 5", description: "Most capable" },
+          ],
+        },
+        // No "effort" option — the race-exposed transient
+      ];
+
+      (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
+        query: {
+          setPermissionMode: setPermissionModeSpy,
+          setModel: setModelSpy,
+          applyFlagSettings: applyFlagSettingsSpy,
+          supportedCommands: async () => [],
+        },
+        input: null,
+        cancelled: false,
+        permissionMode: "default",
+        settingsManager: {},
+        modes: structuredClone(MOCK_MODES),
+        models: {
+          currentModelId: "claude-sonnet-4-6",
+          availableModels: [
+            { modelId: "claude-sonnet-4-6", name: "Claude Sonnet", description: "Balanced" },
+            { modelId: "fable", name: "Claude Fable 5", description: "Most capable" },
+          ],
+        },
+        modelInfos: withEffortCapableModelInfo ? [sonnetInfo, fableInfo] : [sonnetInfo],
+        configOptions: configOptionsNoEffort,
+        contextWindowSize: 200000,
+      };
+    }
+
+    it("accepts effort set before set_model(fable) when modelInfos advertises effort-capable model", async () => {
+      populateResumeSession({ withEffortCapableModelInfo: true });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "medium",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalled();
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect(effortOption?.currentValue).toBe("medium");
+    });
+
+    it("accepts effort even when no effort-capable model is yet in modelInfos (worst-case race)", async () => {
+      populateResumeSession({ withEffortCapableModelInfo: false });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "high",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalled();
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect(effortOption?.currentValue).toBe("high");
+    });
+
+    it("accepts effort=default when effort option is transiently absent", async () => {
+      populateResumeSession({ withEffortCapableModelInfo: true });
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "default",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalled();
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect(effortOption?.currentValue).toBe("default");
+    });
+
+    it("rejects an unknown effort value with Invalid-value error (not Unknown-option)", async () => {
+      populateResumeSession({ withEffortCapableModelInfo: true });
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "effort",
+          value: "super-high",
+        }),
+      ).rejects.toThrow("Invalid value for config option effort: super-high");
+    });
+
+    it("still throws Unknown config option for non-effort unknown configId", async () => {
+      populateResumeSession({ withEffortCapableModelInfo: true });
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "thinking_depth",
+          value: "medium",
+        }),
+      ).rejects.toThrow("Unknown config option: thinking_depth");
+    });
+  });
 });
