@@ -1958,6 +1958,56 @@ export class ClaudeAcpAgent implements Agent {
 
     const option = session.configOptions.find((o) => o.id === params.configId);
     if (!option) {
+      // Tolerance guard for the RESUME race (brick c1cde4bd): on session/resume
+      // currentModelId is transiently the box-default (non-effort-capable) while
+      // acpx fires set_config_option{effort} before set_model(fable) settles.
+      // buildConfigOptions therefore produces no effort entry; the lookup above
+      // returns undefined; the plain throw below surfaces as an internal error.
+      // Instead: when configId is "effort", accept any valid ladder level that
+      // any advertised model supports, apply it to the SDK, and synthesize the
+      // option so configOptions stays coherent.  Keep the hard throw for
+      // genuinely-unknown ids (mode/model typos).
+      if (params.configId === "effort") {
+        const advertisedLevels: string[] = Array.from(
+          new Set(
+            session.modelInfos
+              .filter((m) => m.supportsEffort)
+              .flatMap((m) => m.supportedEffortLevels ?? []),
+          ),
+        );
+        // Fall back to the canonical injected-model ladder when no effort-capable
+        // model is in modelInfos yet (worst-case race: modelInfos not yet updated).
+        const validLevels =
+          advertisedLevels.length > 0 ? advertisedLevels : [...INJECTED_MODEL_EFFORT_LEVELS];
+        const isValid =
+          params.value === "default" || (validLevels as string[]).includes(params.value);
+        if (!isValid) {
+          throw new Error(`Invalid value for config option effort: ${params.value}`);
+        }
+        await applyEffortToSdk(session.query, params.value);
+        session.configOptions = [
+          ...session.configOptions,
+          {
+            type: "select" as const,
+            id: "effort",
+            name: "Effort",
+            description: "Available effort levels for this model",
+            category: "thought_level",
+            currentValue: params.value,
+            options: [
+              { value: "default", name: "Default" },
+              ...validLevels.map((level) => ({
+                value: level,
+                name: level
+                  .split(/[_-]/)
+                  .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+                  .join(" "),
+              })),
+            ],
+          },
+        ];
+        return { configOptions: session.configOptions };
+      }
       throw new Error(`Unknown config option: ${params.configId}`);
     }
 
