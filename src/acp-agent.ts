@@ -3731,6 +3731,30 @@ const FABLE_MODEL_ID = "fable";
 const OPUS_MODEL_ID = "opus";
 
 /**
+ * The modern Claude reasoning-effort ladder that Fable 5 and Opus 4.x fully
+ * support (verified against the claude-api skill: low/medium/high/xhigh/max, GA).
+ *
+ * Both `fable` and `opus` are INJECTED into the advertised model list (the SDK
+ * never surfaces `fable`, and `opus` only when the resolved list lacks it), so —
+ * unlike SDK-surfaced models, which arrive with their effort capability already
+ * populated — the injected `ModelInfo` must supply it. Advertising this ladder is
+ * what keeps the effort config option alive across a mid-session switch to fable
+ * or opus, so `setSessionConfigOption("effort", ...)` succeeds instead of
+ * throwing "Unknown config option: effort" (surfaced to the user as an "internal
+ * error"). Shared by both injections to avoid drift. (brick 2a928fd7)
+ *
+ * Typed against the SDK union so any future divergence of the effort ladder is a
+ * compile error, not a silent mismatch with buildConfigOptions' label/clamp path.
+ */
+const INJECTED_MODEL_EFFORT_LEVELS: NonNullable<ModelInfo["supportedEffortLevels"]> = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/**
  * Additively advertise the Claude "fable" model on top of the resolved
  * SDK/allowlist model set.
  *
@@ -3759,7 +3783,7 @@ const OPUS_MODEL_ID = "opus";
  *   resolved concrete id (`claude-fable-5`) on resume — which is what kept the
  *   acpx replay gate accepting the persisted `fable` alias.
  */
-function injectFableModel(
+export function injectFableModel(
   state: SessionModelState,
   modelInfos: ModelInfo[],
 ): { state: SessionModelState; modelInfos: ModelInfo[] } {
@@ -3770,6 +3794,11 @@ function injectFableModel(
     value: FABLE_MODEL_ID,
     displayName: "Fable",
     description: "Fable (1M context)",
+    // Fable 5 supports the full reasoning-effort ladder. Without this the effort
+    // config option is dropped on a mid-session switch to fable, and the next
+    // effort set throws "Unknown config option: effort". (brick 2a928fd7)
+    supportsEffort: true,
+    supportedEffortLevels: INJECTED_MODEL_EFFORT_LEVELS,
   };
   return {
     state: {
@@ -3787,7 +3816,7 @@ function injectFableModel(
   };
 }
 
-function injectOpusModel(
+export function injectOpusModel(
   state: SessionModelState,
   modelInfos: ModelInfo[],
 ): { state: SessionModelState; modelInfos: ModelInfo[] } {
@@ -3798,6 +3827,11 @@ function injectOpusModel(
     value: OPUS_MODEL_ID,
     displayName: "Opus",
     description: "Opus 4.8",
+    // Opus 4.x supports the full reasoning-effort ladder — same latent defect as
+    // fable: without this the effort option is dropped on a mid-session switch to
+    // opus and the next effort set throws. (brick 2a928fd7)
+    supportsEffort: true,
+    supportedEffortLevels: INJECTED_MODEL_EFFORT_LEVELS,
   };
   return {
     state: {
