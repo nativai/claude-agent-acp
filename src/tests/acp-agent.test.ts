@@ -1824,6 +1824,176 @@ describe("stop reason propagation", () => {
   });
 });
 
+describe("errorKind on thrown send-failure path", () => {
+  // Tests for the outer catch block that handles errors thrown by query()
+  // (the send-failure / thrown-query path) — errorKindFromThrown() must
+  // classify recognisable errors so acpx failover dispatches on the machine
+  // signal instead of falling back to string matching.
+
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function injectSessionThatThrows(agent: ClaudeAcpAgent, errorToThrow: Error) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      if (userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      throw errorToThrow;
+    }
+    agent.sessions["test-session"] = {
+      query: Object.assign(messageGenerator(), { interrupt: vi.fn() }) as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      activePromptResolve: null,
+      pendingSdkMessages: [],
+      backgroundLoopError: null,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    (agent as any).startBackgroundReaderLoop("test-session");
+  }
+
+  async function captureError(agent: ClaudeAcpAgent) {
+    return agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] })
+      .then(
+        () => null,
+        (e: unknown) => e,
+      );
+  }
+
+  it("attaches rate_limit errorKind when the SDK error type is rate_limit_error", async () => {
+    const agent = createMockAgent();
+    const err = Object.assign(
+      new Error("Internal error: You've hit your monthly spend limit · raise it at claude.ai"),
+      { type: "rate_limit_error" },
+    );
+    injectSessionThatThrows(agent, err);
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "rate_limit" });
+  });
+
+  it("attaches authentication_failed errorKind when the SDK error type is authentication_error", async () => {
+    const agent = createMockAgent();
+    const err = Object.assign(new Error("Invalid API key"), { type: "authentication_error" });
+    injectSessionThatThrows(agent, err);
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "authentication_failed" });
+  });
+
+  it("attaches billing_error errorKind when the SDK error type is billing_error", async () => {
+    const agent = createMockAgent();
+    const err = Object.assign(new Error("Your account has a billing problem"), {
+      type: "billing_error",
+    });
+    injectSessionThatThrows(agent, err);
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "billing_error" });
+  });
+
+  it("attaches rate_limit errorKind via HTTP status 429 when no error type field", async () => {
+    const agent = createMockAgent();
+    const err = Object.assign(new Error("Too Many Requests"), { status: 429 });
+    injectSessionThatThrows(agent, err);
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "rate_limit" });
+  });
+
+  it("attaches authentication_failed errorKind via HTTP status 401", async () => {
+    const agent = createMockAgent();
+    const err = Object.assign(new Error("Unauthorized"), { status: 401 });
+    injectSessionThatThrows(agent, err);
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "authentication_failed" });
+  });
+
+  it("attaches rate_limit via message heuristic — monthly spend limit phrase", async () => {
+    const agent = createMockAgent();
+    injectSessionThatThrows(
+      agent,
+      new Error(
+        "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage",
+      ),
+    );
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "rate_limit" });
+  });
+
+  it("attaches rate_limit via message heuristic — weekly limit phrase", async () => {
+    const agent = createMockAgent();
+    injectSessionThatThrows(
+      agent,
+      new Error("Internal error: You've hit your weekly limit · resets 12pm (UTC)"),
+    );
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "rate_limit" });
+  });
+
+  it("attaches rate_limit via message heuristic — 'out of usage' phrase", async () => {
+    const agent = createMockAgent();
+    injectSessionThatThrows(agent, new Error("The subscription is out of usage"));
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "rate_limit" });
+  });
+
+  it("attaches billing_error via message heuristic — credit balance phrase", async () => {
+    const agent = createMockAgent();
+    injectSessionThatThrows(agent, new Error("Your credit balance is too low to complete this"));
+    const result = await captureError(agent);
+    expect(result).not.toBeNull();
+    expect((result as { data?: unknown }).data).toEqual({ errorKind: "billing_error" });
+  });
+
+  it("does not attach errorKind for generic unrelated errors", async () => {
+    const agent = createMockAgent();
+    injectSessionThatThrows(agent, new Error("output exceeds the character limit"));
+    const result = await captureError(agent);
+    // Falls through — raw Error is re-thrown, so result is the Error itself
+    expect(result).toBeInstanceOf(Error);
+    expect((result as { data?: unknown }).data).toBeUndefined();
+  });
+});
+
 describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {
