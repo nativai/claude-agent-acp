@@ -2472,6 +2472,20 @@ describe("inferContextWindowFromModel", () => {
     expect(inferContextWindowFromModel("fable", "Fable (1M context)")).toBe(1_000_000);
   });
 
+  it("infers 1M for the Fable family by id, with no description (brick ef7be3f5)", () => {
+    // REGRESSION: after the CC upgrade the binary natively surfaces the concrete
+    // `claude-fable-5`, and the mid-stream usage path infers from the bare SDK
+    // model id with NO description (message_start). Without id-based recognition
+    // this returns null → the 200k default is advertised for the whole Fable
+    // turn (specimen d5f2c995) and the agent compacts as if its window were 200k.
+    expect(inferContextWindowFromModel("claude-fable-5")).toBe(1_000_000);
+    // The `fable` alias must also be recognised by id alone (no description),
+    // since the mid-stream path never carries a description.
+    expect(inferContextWindowFromModel("fable")).toBe(1_000_000);
+    // A `[1m]` run-hinted Fable id stays 1M too.
+    expect(inferContextWindowFromModel("fable[1m]")).toBe(1_000_000);
+  });
+
   it("keeps plain `opus` (Opus 4.8) at the default 200k window", () => {
     // The crux of W13-12: `opus` and `default` are both Opus 4.8 with the same
     // base id; only `default`'s description mentions 1M, so `opus` must NOT be
@@ -2856,6 +2870,57 @@ describe("usage_update computation", () => {
     expect(usageUpdates).toHaveLength(2);
     expect(usageUpdates[0].update.size).toBe(1000000);
     expect(usageUpdates[1].update.size).toBe(1000000);
+  });
+
+  it("mid-stream size is 1M for a Fable turn from the first update (brick ef7be3f5)", async () => {
+    // REGRESSION (specimen d5f2c995): the bundled Claude Code binary now
+    // natively surfaces the concrete `claude-fable-5` id, which `message_start`
+    // reports (with no description). Before the fix, the mid-stream re-guess in
+    // acp-agent.ts (`inferContextWindowFromModel(model)`) returned null for
+    // `claude-fable-5` → the first usage_update advertised the 200k default and
+    // only the end-of-turn `result` flipped it to 1M. The agent thus perceived a
+    // 200k window for the entire turn and compacted early. This asserts BOTH
+    // updates report 1M, so the very first mid-stream update is already correct.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-fable-5",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-fable-5": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(2);
+    // The crux: the FIRST mid-stream update must already be 1M, not 200k.
+    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[1].update.size).toBe(1000000);
+    // Hint-poisoning guard: `session.contextWindowSize` is what acpx persists
+    // and round-trips as `contextWindowSizeHint` on resume. It must never dip to
+    // 200k during a Fable turn — a single 200k emission would re-seed 200k on the
+    // next resume (the exact cascade that recurred on specimen d5f2c995).
+    expect(agent.sessions["test-session"].contextWindowSize).toBe(1000000);
   });
 
   it("duplicate stream_event totals do not re-emit usage_update", async () => {

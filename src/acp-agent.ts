@@ -4744,6 +4744,20 @@ function commonPrefixLength(a: string, b: string) {
  *     model's capabilities"); there is no structured context-window field. */
 export function inferContextWindowFromModel(model: string, description?: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
+  // Fable is a 1M-context model in EVERY form the adapter sees it: the injected
+  // `fable` alias AND the concrete `claude-fable-5` the bundled binary resolves
+  // it to (CC ≥2.1.172, which now natively surfaces `claude-fable-5`). The
+  // concrete id carries no `\b1m\b` token, and its SDK-native ModelInfo reads
+  // "Fable 5 · Most capable…" — no "1M context" phrase — so neither the id nor
+  // the description branch below matches it. Recognise the family by id here so
+  // the pre-result mid-stream path works: `message_start` reports the concrete
+  // `claude-fable-5` with NO description, so without this every Fable turn
+  // advertises the 200k default until the end-of-turn `result` corrects it — the
+  // agent perceives a 200k window and compacts early, and any emitted 200k
+  // poisons the persisted `contextWindowSizeHint` that a resume round-trips.
+  // (brick ef7be3f5 — regression after the CC upgrade surfaced `claude-fable-5`;
+  // the prior fix a1762e24 only tagged the `fable` ALIAS description.)
+  if (/\bfable\b/i.test(model)) return 1_000_000;
   if (description && /\b1m\b[\s_-]*context/i.test(description)) return 1_000_000;
   return null;
 }
