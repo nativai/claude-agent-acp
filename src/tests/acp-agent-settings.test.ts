@@ -807,14 +807,14 @@ describe("ClaudeAcpAgent settings", () => {
       { value: "sonnet", displayName: "Sonnet", description: "" },
       { value: "sonnet[1m]", displayName: "Sonnet (1M context)", description: "" },
       { value: "haiku", displayName: "Haiku", description: "" },
-      { value: "claude-opus-4-8[1m]", displayName: "Opus 4.8 (1M context)", description: "" },
+      { value: "claude-opus-5[1m]", displayName: "Opus 5 (1M context)", description: "" },
     ]);
 
     // The opus model is advertised under the same stable alias in both phases,
     // and the volatile resolved id is never advertised.
     expect(newAdvertised).toContain("opus[1m]");
     expect(resumeAdvertised).toContain("opus[1m]");
-    expect(resumeAdvertised).not.toContain("claude-opus-4-8[1m]");
+    expect(resumeAdvertised).not.toContain("claude-opus-5[1m]");
   });
 
   it("skips the initial setModel when the resolved value matches the SDK's model list verbatim", async () => {

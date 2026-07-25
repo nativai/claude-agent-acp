@@ -101,7 +101,7 @@ const MOCK_MODES = {
 };
 
 const MODEL_INFOS: ModelInfo[] = [
-  { value: "default", displayName: "Default", description: "Opus 4.8 (1M context)" },
+  { value: "default", displayName: "Default", description: "Opus 5 (1M context)" },
   {
     value: "sonnet",
     displayName: "Sonnet",
@@ -332,7 +332,7 @@ describe("context window hint restoration on resume (fix A)", () => {
     // The box-default `default` model already infers 1M from its description;
     // restoring the same 1M hint must not regress it.
     sdkInitModels.current = [
-      { value: "default", displayName: "Default", description: "Opus 4.8 with 1M context" },
+      { value: "default", displayName: "Default", description: "Opus 5 with 1M context" },
     ];
     const { sessionId } = await agent.newSession({
       cwd: "/test",

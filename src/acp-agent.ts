@@ -3976,10 +3976,18 @@ export function injectOpusModel(
   const opusInfo: ModelInfo = {
     value: OPUS_MODEL_ID,
     displayName: "Opus",
-    description: "Opus 4.8",
-    // Opus 4.x supports the full reasoning-effort ladder — same latent defect as
-    // fable: without this the effort option is dropped on a mid-session switch to
-    // opus and the next effort set throws. (brick 2a928fd7)
+    // Version-neutral on purpose. The `opus` alias tracks whatever the bundled
+    // binary resolves it to — `claude-opus-5` on CC 2.1.219 (verified: an `opus`
+    // pin serves `claude-opus-5`), `claude-opus-4-8` before it — so a hardcoded
+    // vintage ("Opus 4.8") rots on every model bump (this string was stale the
+    // moment the SDK went 0.3.172 → 0.3.219). "Opus" survives future bumps.
+    // MUST NOT contain a "1M context" phrase: `inferContextWindowFromModel`
+    // reads this description to keep the `opus` alias at the 200k default,
+    // distinct from `default`/`opus[1m]` (whose descriptions carry "1M context").
+    description: "Opus",
+    // The Opus family supports the full reasoning-effort ladder — same latent
+    // defect as fable: without this the effort option is dropped on a mid-session
+    // switch to opus and the next effort set throws. (brick 2a928fd7)
     supportsEffort: true,
     supportedEffortLevels: INJECTED_MODEL_EFFORT_LEVELS,
   };
@@ -4754,12 +4762,13 @@ function commonPrefixLength(a: string, b: string) {
  *     token (e.g. "claude-opus-4-6-1m"); `\b1m\b` catches it without also
  *     matching "10m" or an embedded substring.
  *  2. "1M context" in the model's `description`. This is the ONLY pre-result
- *     signal that separates the box-default `default` model (Opus 4.8 *with 1M
- *     context* → 1,000,000) from plain `opus` (Opus 4.8 → 200,000): both
- *     resolve to the same base API model id (`claude-opus-4-8`), so the ID
- *     alone cannot tell them apart. The model menu's own description carries
- *     the distinction — the `default` ModelInfo reads "Opus 4.8 with 1M
- *     context", while `opus`'s reads just "Opus 4.8" and stays at the default.
+ *     signal that separates the box-default `default` model (the current Opus
+ *     *with 1M context* → 1,000,000) from plain `opus` (base Opus → 200,000):
+ *     both resolve to the same base API model id (`claude-opus-5` on CC 2.1.219,
+ *     `claude-opus-4-8` before it), so the ID alone cannot tell them apart. The
+ *     model menu's own description carries the distinction — the `default`
+ *     ModelInfo reads "Opus 5 with 1M context", while our injected `opus` row
+ *     reads just "Opus" (no "1M context" phrase) and stays at the default.
  *     `description` is the SDK `ModelInfo.description` ("Description of the
  *     model's capabilities"); there is no structured context-window field. */
 export function inferContextWindowFromModel(model: string, description?: string): number | null {
