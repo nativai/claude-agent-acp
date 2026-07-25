@@ -1275,6 +1275,21 @@ export class ClaudeAcpAgent implements Agent {
                 // simply aren't advertised until the next session load.
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "control_request_progress":
+              case "model_refusal_no_fallback":
+              case "background_tasks_changed":
+              case "worker_shutting_down":
+              case "informational":
+                // New `system` subtypes surfaced by the bundled CC ≥2.1.219
+                // (claude-agent-sdk 0.3.219). All are operational/progress
+                // signals with no ACP surface today: `control_request_progress`
+                // (permission-request progress pings), `model_refusal_no_fallback`
+                // (a refusal the engine could NOT fall back from — distinct from
+                // `model_refusal_fallback` above, which it recovered), background-
+                // task lifecycle, worker shutdown, and free-form informational
+                // notices. Intentional no-op — keeping the switch exhaustive so a
+                // future SDK subtype is a compile error, not a silent drop.
+                break;
               case "model_refusal_fallback": {
                 // New in the bundled CC ≥2.1.157. The active model refused this
                 // turn and the SDK transparently fell back to another model
@@ -1715,6 +1730,11 @@ export class ClaudeAcpAgent implements Agent {
           case "auth_status":
           case "prompt_suggestion":
           case "rate_limit_event":
+          case "conversation_reset":
+            // `conversation_reset` is new in the bundled CC ≥2.1.219
+            // (claude-agent-sdk 0.3.219): the engine cleared its in-context
+            // conversation (e.g. an auto-compaction/reset). No ACP surface today;
+            // intentional no-op, kept explicit so the switch stays exhaustive.
             break;
           default:
             unreachable(message);
