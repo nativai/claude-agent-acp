@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import {
+  AgentSideConnection,
+  SessionNotification,
+  type SessionModelState,
+} from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { injectFableModel, injectOpusModel } from "../acp-agent.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -446,7 +451,7 @@ describe("session config options", () => {
         (o: any) => o.id === "effort",
       );
       expect(effortOption).toBeUndefined();
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("clamps effort in config_option_update when new model has different supported levels", async () => {
@@ -485,7 +490,7 @@ describe("session config options", () => {
       );
       expect(effortOption).toBeDefined();
       expect(effortOption.currentValue).toBe("default");
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("preserves effort in config_option_update when new model supports same level", async () => {
@@ -555,7 +560,58 @@ describe("session config options", () => {
         value: "low",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "low" });
+      // The pinned effort now rides the FLAG-tier `env` block (authoritative,
+      // beats the box's re-applied user-tier CLAUDE_CODE_EFFORT_LEVEL); the
+      // effortLevel key is kept coherent for in-union values. (brick 5f35da58)
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "low" },
+        effortLevel: "low",
+      });
+    });
+
+    it("routes an out-of-union 'max' pin through the env path only (no effortLevel key)", async () => {
+      // Arrange: make "max" a selectable effort level for this session.
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      effortOpt.options.push({ value: "max", name: "Max" });
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "max",
+      });
+
+      // "max" is outside the SDK `effortLevel` union, so it must ride ONLY the
+      // authoritative env path — the effortLevel key is omitted, never set to a
+      // bogus out-of-union "max". This is precisely what makes a
+      // `--reasoning-effort max` pin win over the box's user-tier
+      // CLAUDE_CODE_EFFORT_LEVEL=high (the hostile ambient env is exercised
+      // end-to-end in the self-test). (brick 5f35da58)
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+      });
+      const calls = applyFlagSettingsSpy.mock.calls;
+      const lastCall = calls[calls.length - 1]?.[0];
+      expect(lastCall).not.toHaveProperty("effortLevel");
+    });
+
+    it("sets both env and effortLevel for an in-union 'xhigh' pin", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      effortOpt.options.push({ value: "xhigh", name: "Extra High" });
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "xhigh",
+      });
+
+      // "xhigh" is in the SDK union, so both channels are set: the env block
+      // (authoritative) and the effortLevel key (label/clamp coherence).
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "xhigh" },
+        effortLevel: "xhigh",
+      });
     });
 
     it("calls applyFlagSettings with null effortLevel for 'default'", async () => {
@@ -570,7 +626,7 @@ describe("session config options", () => {
         value: "default",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
 
       // The SDK's applyFlagSettings travels over a JSON pipe and only clears a
       // flag-layer key when an explicit `null` is sent — `undefined` is
@@ -689,7 +745,7 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("adds effort option when switching to a model that supports effort", async () => {
@@ -760,7 +816,7 @@ describe("session config options", () => {
       // "max" is not in sonnet's levels, so should fall back to "default" (no effort override)
       expect(effortOption?.currentValue).toBe("default");
       // SDK should be told to clear the effort override
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ env: null, effortLevel: null });
     });
 
     it("preserves effort value when new model supports the same level", async () => {
@@ -1222,6 +1278,200 @@ describe("session config options", () => {
       expect(capturedPermissionRequest).not.toBeNull();
       const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
       expect(optionIds).toContain("auto");
+    });
+  });
+
+  // Regression repro for brick 2a928fd7: switching a running session Sonnet→Fable
+  // (or →Opus) then setting thinking depth high→medium/low threw "Unknown config
+  // option: effort" (surfaced to the user as "internal error"). Root cause: the
+  // adapter INJECTS fable/opus into the advertised model list (the SDK never
+  // surfaces fable, and opus only when the resolved list lacks it) with a PARTIAL
+  // ModelInfo that omitted `supportsEffort`/`supportedEffortLevels`. After the
+  // mid-session switch, buildConfigOptions dropped the effort option, and
+  // setSessionConfigOption then threw. These tests drive the REAL injection
+  // functions so they are coupled to production: a partial (effort-less) injected
+  // ModelInfo makes them red; the capability fix makes them green with no test
+  // change. Fable 5 / Opus 4.x support the full ladder (claude-api skill), so the
+  // fix is to advertise it — there is no legible-restriction path.
+  const FULL_EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"];
+
+  describe("injected fable/opus models carry effort capability (brick 2a928fd7)", () => {
+    // Build a session whose advertised model list was produced by the REAL
+    // injection function `inject`, starting from an effort-capable Opus-4.5 base
+    // (so the effort option is present pre-switch, exactly as createSession would
+    // have produced it).
+    function populateInjectedSession(inject: typeof injectFableModel) {
+      setPermissionModeSpy = vi.fn();
+      setModelSpy = vi.fn();
+      applyFlagSettingsSpy = vi.fn();
+
+      const baseModelInfos: ModelInfo[] = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus 4.5",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+        },
+      ];
+      const baseState: SessionModelState = {
+        currentModelId: "claude-opus-4-5",
+        availableModels: [
+          { modelId: "claude-opus-4-5", name: "Claude Opus 4.5", description: "Most capable" },
+        ],
+      };
+
+      // Drive the REAL injection to add the fable/opus entry to the advertised list.
+      const { state, modelInfos } = inject(baseState, baseModelInfos);
+
+      const configOptions = [
+        {
+          id: "mode",
+          name: "Mode",
+          type: "select",
+          category: "mode",
+          currentValue: "default",
+          options: MOCK_MODES.availableModes.map((m) => ({
+            value: m.id,
+            name: m.name,
+            description: m.description,
+          })),
+        },
+        {
+          id: "model",
+          name: "Model",
+          type: "select",
+          category: "model",
+          currentValue: "claude-opus-4-5",
+          options: state.availableModels.map((m) => ({
+            value: m.modelId,
+            name: m.name,
+            description: m.description,
+          })),
+        },
+        {
+          id: "effort",
+          name: "Effort",
+          type: "select",
+          category: "thought_level",
+          currentValue: "default",
+          options: [
+            { value: "default", name: "Default" },
+            { value: "low", name: "Low" },
+            { value: "medium", name: "Medium" },
+            { value: "high", name: "High" },
+            { value: "xhigh", name: "Xhigh" },
+            { value: "max", name: "Max" },
+          ],
+        },
+      ];
+
+      (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
+        query: {
+          setPermissionMode: setPermissionModeSpy,
+          setModel: setModelSpy,
+          applyFlagSettings: applyFlagSettingsSpy,
+          supportedCommands: async () => [],
+        },
+        input: null,
+        cancelled: false,
+        permissionMode: "default",
+        settingsManager: {},
+        modes: structuredClone(MOCK_MODES),
+        models: structuredClone(state),
+        modelInfos,
+        configOptions,
+        contextWindowSize: 200000,
+      };
+    }
+
+    it("injectFableModel advertises the full effort ladder", () => {
+      const { modelInfos } = injectFableModel(
+        { currentModelId: "claude-opus-4-5", availableModels: [] },
+        [],
+      );
+      const fable = modelInfos.find((m) => m.value === "fable");
+      expect(fable?.supportsEffort).toBe(true);
+      expect(fable?.supportedEffortLevels).toEqual(FULL_EFFORT_LADDER);
+    });
+
+    it("injectOpusModel advertises the full effort ladder", () => {
+      const { modelInfos } = injectOpusModel(
+        { currentModelId: "claude-sonnet-4-6", availableModels: [] },
+        [],
+      );
+      const opus = modelInfos.find((m) => m.value === "opus");
+      expect(opus?.supportsEffort).toBe(true);
+      expect(opus?.supportedEffortLevels).toEqual(FULL_EFFORT_LADDER);
+    });
+
+    it("keeps the effort option after switching to fable, and effort medium/low succeed", async () => {
+      populateInjectedSession(injectFableModel);
+
+      // Switch the session's model to the injected fable (control op) — drives
+      // the same applyConfigOptionValue model path Daniel hit.
+      const afterSwitch = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "fable",
+      });
+      expect(setModelSpy).toHaveBeenCalledWith("fable");
+
+      // Pre-fix this was undefined (option dropped) → the next set threw
+      // "Unknown config option: effort". Post-fix it persists with the full ladder.
+      const effortOption = afterSwitch.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect((effortOption as any).options.map((o: any) => o.value)).toEqual([
+        "default",
+        ...FULL_EFFORT_LADDER,
+      ]);
+
+      // Daniel's exact sequence: high → medium, then → low. Both must succeed.
+      const afterMedium = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "medium",
+      });
+      expect(afterMedium.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("medium");
+
+      const afterLow = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+      expect(afterLow.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+    });
+
+    it("keeps the effort option after switching to opus, and effort medium/low succeed", async () => {
+      populateInjectedSession(injectOpusModel);
+
+      const afterSwitch = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "opus",
+      });
+      expect(setModelSpy).toHaveBeenCalledWith("opus");
+
+      const effortOption = afterSwitch.configOptions.find((o) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect((effortOption as any).options.map((o: any) => o.value)).toEqual([
+        "default",
+        ...FULL_EFFORT_LADDER,
+      ]);
+
+      const afterMedium = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "medium",
+      });
+      expect(afterMedium.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("medium");
+
+      const afterLow = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+      expect(afterLow.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
     });
   });
 });

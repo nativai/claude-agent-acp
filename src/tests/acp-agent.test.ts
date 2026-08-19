@@ -32,6 +32,7 @@ import {
   ClaudeAcpAgent,
   claudeCliPath,
   describeAlwaysAllow,
+  inferContextWindowFromModel,
   streamEventToAcpNotifications,
   RESUME_HEARTBEAT_MS,
   INIT_HARD_MS,
@@ -1552,6 +1553,7 @@ describe("stop reason propagation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -1699,6 +1701,7 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -1861,6 +1864,7 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -1947,6 +1951,7 @@ describe("session/delete", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -2050,6 +2055,7 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -2142,6 +2148,177 @@ describe("getOrCreateSession param change detection", () => {
 
     expect(agent.sessions["s1"]).toBe(session);
     expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+});
+
+describe("FW-12: lazy-resume of out-of-band durable fork id", () => {
+  // acpx's Claude copy path replaces the id our session/fork returns with its
+  // own durable forked-transcript id, then drives session/set_model (and
+  // config ops) on that id over the same connection WITHOUT a prior
+  // session/resume. Those ops must lazily resume the durable transcript from
+  // disk instead of throwing "Session not found" (-32603) — FW-12.
+  function createMockAgent() {
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function registerLiveSession(agent: ClaudeAcpAgent, sessionId: string, cwd: string) {
+    function* empty() {}
+    const gen = Object.assign(empty(), {
+      interrupt: vi.fn(),
+      close: vi.fn(),
+      setModel: vi.fn(),
+      setPermissionMode: vi.fn(),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+    });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      cwd,
+      sessionFingerprint: "fp",
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      activePromptResolve: null,
+      pendingSdkMessages: [],
+      backgroundLoopError: null,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    return agent.sessions[sessionId]!;
+  }
+
+  it("does not attempt a resume for an unknown id when no fork happened on this connection", async () => {
+    const agent = createMockAgent();
+    const spy = vi.spyOn(agent as any, "getOrCreateSession");
+    await expect(
+      agent.unstable_setSessionModel({ sessionId: "never-seen", modelId: "sonnet" }),
+    ).rejects.toThrow("Session not found");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("lazily resumes the durable fork id on post-fork set_model, using the fork's cwd", async () => {
+    const agent = createMockAgent();
+    (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
+    const durableId = "durable-fork-id";
+    const getOrCreate = vi
+      .spyOn(agent as any, "getOrCreateSession")
+      .mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as { sessionId: string; cwd: string };
+        registerLiveSession(agent, p.sessionId, p.cwd);
+        return { sessionId: p.sessionId };
+      });
+    const updateSpy = vi.spyOn(agent as any, "updateConfigOption").mockResolvedValue(undefined);
+
+    await expect(
+      agent.unstable_setSessionModel({ sessionId: durableId, modelId: "sonnet" }),
+    ).resolves.toBeUndefined();
+
+    expect(getOrCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: durableId, cwd: "/fork-cwd" }),
+    );
+    expect(agent.sessions[durableId]!.query.setModel).toHaveBeenCalledWith("sonnet");
+    expect(updateSpy).toHaveBeenCalled();
+  });
+
+  it("surfaces the underlying resume error (not opaque 'Session not found') when the durable transcript cannot be resumed", async () => {
+    const agent = createMockAgent();
+    (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
+    vi.spyOn(agent as any, "getOrCreateSession").mockRejectedValue(
+      new Error("No conversation found with session ID"),
+    );
+    // Fork brick 29efbe0c: when the lazy resume of an out-of-band durable fork id
+    // throws, the real reason must reach acpx/the UI so a failed non-default-model
+    // fork is diagnosable — it must NOT be collapsed to an opaque "Session not
+    // found" (which is reserved for a genuinely-unknown id / no lastForkContext).
+    await expect(
+      agent.unstable_setSessionModel({ sessionId: "missing-durable", modelId: "sonnet" }),
+    ).rejects.toThrow("No conversation found with session ID");
+  });
+
+  it("applies the same lazy resume to set_config_option after a fork", async () => {
+    const agent = createMockAgent();
+    (agent as any).lastForkContext = { cwd: "/fork-cwd", mcpServers: [] };
+    const getOrCreate = vi
+      .spyOn(agent as any, "getOrCreateSession")
+      .mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as { sessionId: string; cwd: string };
+        registerLiveSession(agent, p.sessionId, p.cwd);
+        return { sessionId: p.sessionId };
+      });
+    // The mock session advertises no config options, so resolution succeeds and
+    // we reach the option lookup — proving the session was resolved (not "Session not found").
+    await expect(
+      agent.setSessionConfigOption({ sessionId: "durable-2", configId: "model", value: "sonnet" }),
+    ).rejects.toThrow("Unknown config option");
+    expect(getOrCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "durable-2", cwd: "/fork-cwd" }),
+    );
+  });
+});
+
+describe("inferContextWindowFromModel", () => {
+  it("infers 1M from a `1m` token in the model id", () => {
+    expect(inferContextWindowFromModel("claude-opus-4-6-1m")).toBe(1_000_000);
+    expect(inferContextWindowFromModel("opus[1m]")).toBe(1_000_000);
+    expect(inferContextWindowFromModel("sonnet[1m]")).toBe(1_000_000);
+  });
+
+  it("does not treat `10m`/`41m` as the 1M token", () => {
+    expect(inferContextWindowFromModel("claude-foo-10m")).toBeNull();
+    expect(inferContextWindowFromModel("claude-opus-41m")).toBeNull();
+  });
+
+  it("infers 1M from a '1M context' description when the id has no token", () => {
+    // The box-default `default` model shares the base API id `claude-opus-4-8`
+    // with plain `opus`, so only the model-menu description ("Opus 4.8 with 1M
+    // context") reveals its 1M window.
+    expect(
+      inferContextWindowFromModel(
+        "default",
+        "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+      ),
+    ).toBe(1_000_000);
+    expect(inferContextWindowFromModel("opus[1m]", "Opus 1M context")).toBe(1_000_000);
+  });
+
+  it("infers 1M for the injected Fable description", () => {
+    // injectFableModel sets description: "Fable (1M context)"; the model id
+    // "fable" has no `\b1m\b` token, so the description is the only signal.
+    expect(inferContextWindowFromModel("fable", "Fable (1M context)")).toBe(1_000_000);
+  });
+
+  it("keeps plain `opus` (Opus 4.8) at the default 200k window", () => {
+    // The crux of W13-12: `opus` and `default` are both Opus 4.8 with the same
+    // base id; only `default`'s description mentions 1M, so `opus` must NOT be
+    // flagged (`null` → caller falls back to DEFAULT_CONTEXT_WINDOW = 200k).
+    expect(inferContextWindowFromModel("opus", "Opus 4.8")).toBeNull();
+  });
+
+  it("does not mis-flag descriptions that mention 1M but not '1M context'", () => {
+    expect(inferContextWindowFromModel("haiku", "Fast · up to 1M tokens output")).toBeNull();
+    expect(
+      inferContextWindowFromModel("sonnet", "Sonnet 4.6 · Efficient for routine tasks"),
+    ).toBeNull();
+  });
+
+  it("returns null with no id token and no description", () => {
+    expect(inferContextWindowFromModel("default")).toBeNull();
+    expect(inferContextWindowFromModel("claude-opus-4-8")).toBeNull();
   });
 });
 
@@ -2287,6 +2464,7 @@ describe("usage_update computation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -2644,6 +2822,129 @@ describe("usage_update computation", () => {
     expect(usageUpdates).toHaveLength(2);
     expect(usageUpdates[0].update.size).toBe(1000000);
     expect(usageUpdates[1].update.size).toBe(1000000);
+  });
+
+  it("switching to the 1M-context `default` model seeds 1M from its description", async () => {
+    // Regression for W13-12: the box-default `default` model is "Opus 4.8 with
+    // 1M context" but shares the base API id `claude-opus-4-8` with plain `opus`
+    // (200k). The model id alone can't tell them apart, so the heuristic reads
+    // the model menu's description to seed 1M at model-switch time — no 200k
+    // flash until the next `result`.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        // Both `opus` and `default` report this same base id on the wire.
+        model: "claude-opus-4-8",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-8": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    // The `default` model's ModelInfo carries the 1M-context description; plain
+    // `opus`'s does not.
+    session.modelInfos = [
+      {
+        value: "default",
+        displayName: "Default (recommended)",
+        description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+      },
+      { value: "opus", displayName: "Opus", description: "Opus 4.8" },
+    ];
+    // Start on plain `opus` (200k) so switching *to* `default` exercises the
+    // window reset (a no-op same-model switch would skip it).
+    session.models = { currentModelId: "opus", availableModels: [] } as any;
+    session.contextWindowSize = 200000;
+    expect(session.contextWindowSize).toBe(200000);
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
+    expect(session.contextWindowSize).toBe(1000000);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(2);
+    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[1].update.size).toBe(1000000);
+  });
+
+  it("switching to plain `opus` stays at 200k (shares base id with `default`)", async () => {
+    // The other half of the W13-12 crux: `opus` is also Opus 4.8, but its
+    // description ("Opus 4.8") has no "1M context", so the heuristic must NOT
+    // flag it — it resets to the 200k default even coming from a 1M model.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [
+      {
+        value: "default",
+        displayName: "Default (recommended)",
+        description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+      },
+      { value: "opus", displayName: "Opus", description: "Opus 4.8" },
+    ];
+    // Pretend a prior 1M model was active so the reset to 200k is observable.
+    session.contextWindowSize = 1000000;
+    session.models = { currentModelId: "default", availableModels: [] } as any;
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "opus");
+    expect(session.contextWindowSize).toBe(200000);
+  });
+
+  it("switching to the restored-hint model re-applies the restored 1M window (fix A model-aware)", async () => {
+    // Brick 92a994a0: the reported bug's real cause. On resume the adapter
+    // seeded 1M for `opus` from the round-tripped hint, but advertises the box
+    // `default` first; acpx then replays the pinned `opus`. Without the
+    // model-aware restore, that switch resets to opus's heuristic (200k),
+    // clobbering the restored 1M before the first post-resume usage_update.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [
+      { value: "default", displayName: "Default", description: "Opus 4.8 with 1M context" },
+      { value: "opus", displayName: "Opus", description: "Opus 4.8" },
+    ];
+    session.restoredContextWindow = { size: 1000000, modelId: "opus" };
+    session.contextWindowSize = 1000000;
+    session.models = { currentModelId: "default", availableModels: [] } as any;
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "opus");
+    // Restored (not the 200k opus heuristic) because the switch lands on the
+    // hint's tagged model.
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("switching to a model that is NOT the restored one falls back to the heuristic (fix A)", async () => {
+    // The restored window is model-scoped: switching to a different model must
+    // not carry it forward — the heuristic governs the new model.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.modelInfos = [{ value: "sonnet", displayName: "Sonnet", description: "Balanced" }];
+    session.restoredContextWindow = { size: 1000000, modelId: "opus" };
+    session.contextWindowSize = 1000000;
+    session.models = { currentModelId: "opus", availableModels: [] } as any;
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "sonnet");
+    expect(session.contextWindowSize).toBe(200000);
   });
 
   it("result with no matching modelUsage preserves the learned window", async () => {
@@ -3190,6 +3491,7 @@ describe("emitRawSDKMessages", () => {
       abortController: new AbortController(),
       emitRawSDKMessages,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -3421,6 +3723,7 @@ describe("result origin handling", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -3604,6 +3907,7 @@ describe("memory_recall handling", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -3837,6 +4141,7 @@ describe("post-error recovery", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -3992,6 +4297,7 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
       abortController: new AbortController(),
       emitRawSDKMessages: false as boolean | SDKMessageFilter[],
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
       contextWindowSize: 200000,
       taskState: new Map(),

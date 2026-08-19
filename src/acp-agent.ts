@@ -166,6 +166,17 @@ export const INIT_HARD_MS = 300_000;
 export const WEDGE_DISPLAY_MS = 90_000;
 
 /**
+ * Hard cap on `session.pendingSdkMessages` (the mid-await SDK-message buffer
+ * introduced to close the `activePromptResolve` routing hole — CONCEPTION §1.1
+ * A1). The buffer only grows while the prompt loop is mid-`await` between parks,
+ * so in practice it holds a handful of messages at most. A count this large means
+ * the loop is wedged and the buffer is masking it — so overflow is a LOUD failure
+ * (stage `backgroundLoopError`, terminate the turn via the existing error path),
+ * never a silent drop (silent drop is the bug being fixed).
+ */
+export const MAX_PENDING_SDK_MESSAGES = 4096;
+
+/**
  * Opt-in, best-effort Tier-1 self-abort (CONCEPTION §4.3 Tier 1). When the env
  * var `ACP_TURN_NOACTIVITY_ABORT_MS` is set to a positive integer, a turn with
  * no delivered message for that many ms tears itself down (abort + close) and
@@ -189,6 +200,13 @@ type LastTurnEndReason = "end_turn" | "max_tokens" | "max_turns" | "error" | "ca
  *  the client's stream (defeating staleness) without changing the stream-tail
  *  kind the server uses to tell `resuming` from `working`. */
 export const SESSION_STATUS_NOTIFICATION = "_claude/sessionStatus";
+/** Out-of-band signal (NOT a `session/update`) emitted when the SDK reports a
+ *  `model_refusal_fallback`: the active model refused the turn and the SDK
+ *  transparently fell back to another model, retracting the already-streamed
+ *  refused partial. Carries the retraction record so a client that tracks
+ *  message identity can evict the superseded messages; non-handling clients
+ *  ignore it (no transcript impact). */
+export const MODEL_REFUSAL_FALLBACK_NOTIFICATION = "_claude/modelRefusalFallback";
 /** `_meta` key carrying the terminal turn reason on the final `usage_update`
  *  `session/update` and on the `PromptResponse`. */
 export const LAST_TURN_END_REASON_META_KEY = "_claude/lastTurnEndReason";
@@ -214,14 +232,32 @@ type Session = {
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Resolve callback for the active prompt's current nextMessage() call. null when idle. */
   activePromptResolve: ((msg: SDKMessage | null) => void) | null;
+  /** SDK messages that arrived while a prompt owns the stream (`promptRunning`)
+   *  but its loop was mid-`await` (no resolver parked). The background reader
+   *  buffers them here instead of diverting them to `handleIdleMessage`, which
+   *  silently discarded turn-control messages (`session_state_changed`, user
+   *  replays) and withheld the turn's response (RCA §1.2, CONCEPTION §1.1 A1).
+   *  `nextMessage()` drains this FIFO before parking. A `null` entry is a
+   *  stream-end / error sentinel so the loop still observes termination. */
+  pendingSdkMessages: (SDKMessage | null)[];
   /** Error captured by the background reader loop, to be re-thrown by the prompt. */
   backgroundLoopError: Error | null;
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Defaults to
-   *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
+   *  before the turn's first result message arrives. Seeded (in precedence
+   *  order) from a restored `contextWindowSizeHint` on resume (fix A), the
+   *  positive heuristic (`inferContextWindowFromModel`), else
+   *  DEFAULT_CONTEXT_WINDOW; refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Fix A (brick 92a994a0): an authoritative context window restored from a
+   *  prior run (via `contextWindowSizeHint`), tagged with the model it belongs
+   *  to. A resume can advertise one model (e.g. the box `default`) and then
+   *  replay the session's pinned model; when that switch lands on `modelId`,
+   *  the model-switch branch re-applies `size` here instead of resetting to the
+   *  plain-alias heuristic (which would clobber a restored 1M back to 200k).
+   *  Absent/`null` when nothing was restored. */
+  restoredContextWindow?: { size: number; modelId: string } | null;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
@@ -285,6 +321,26 @@ export type NewSessionMeta = {
      * - SDKMessageFilter[]: emit only messages matching at least one filter
      */
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
+    /**
+     * Authoritative context-window size (in tokens) that a previous run of
+     * this session already learned from the SDK's `result.modelUsage`, passed
+     * back in on resume so the restored session reports the correct window
+     * from its first mid-stream `usage_update` instead of re-guessing from the
+     * heuristic. The window is a stable property of (model, account); the
+     * caller (acpx) remembers the last authoritative value per session-model
+     * and invalidates it on a model change. Takes precedence over the
+     * heuristic when a positive value is supplied. See `createSession`.
+     */
+    contextWindowSizeHint?: number;
+    /**
+     * The model id `contextWindowSizeHint` was learned for. Because a resume
+     * can advertise a different model first (e.g. the box `default`) and then
+     * replay the session's pinned model, the restored window must be tagged
+     * with its model so the model-switch reset re-applies it (instead of the
+     * heuristic) when the session settles on that model. Without this, the
+     * replay clobbers the restored 1M back to the plain-alias heuristic (200k).
+     */
+    contextWindowSizeHintModel?: string;
   };
   additionalRoots?: string[];
 };
@@ -576,6 +632,25 @@ export class ClaudeAcpAgent implements Agent {
   /** Maps parent tool use ID → subagent info for spawned teammates. */
   subagentCache: Map<string, SubagentInfo> = new Map();
 
+  /**
+   * Creation params of the most recent `session/fork` on this connection.
+   *
+   * When acpx copies a Claude session it does NOT trust the id our
+   * `unstable_forkSession` returns: it materializes its own *durable* forked
+   * transcript (a fresh, independent session id) and then drives
+   * `session/set_model` / `session/set_config_option` on that id over the same
+   * connection — without a preceding `session/resume`. That id was therefore
+   * never registered in `sessions`, so the config op would fail "Session not
+   * found". We keep the fork's creation context here so those ops can lazily
+   * resume the durable transcript from disk (see `resolveSessionForConfigOp`).
+   */
+  private lastForkContext?: {
+    cwd: string;
+    mcpServers: NewSessionRequest["mcpServers"];
+    additionalDirectories?: NewSessionRequest["additionalDirectories"];
+    _meta?: NewSessionRequest["_meta"];
+  };
+
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
     this.client = client;
@@ -744,6 +819,15 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    // Remember the fork's creation context so a follow-up set_model/config on
+    // acpx's out-of-band durable fork id can lazily resume it (see
+    // `lastForkContext` / `resolveSessionForConfigOp`).
+    this.lastForkContext = {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    };
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -819,12 +903,11 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.cancelled = false;
-    session.accumulatedUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    };
+    // A2 (RCA §1.3): the `accumulatedUsage` reset is NOT done here at entry.
+    // A concurrent prompt() that resets on entry — then immediately parks behind
+    // the running turn (below) — zeroes the RUNNING turn's eventual
+    // `sessionUsage(session)` response. Instead each ownership branch below resets
+    // only when this prompt actually takes the stream.
 
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
@@ -865,7 +948,24 @@ export class ClaudeAcpAgent implements Agent {
       if (cancelled) {
         return { stopReason: "cancelled" };
       }
+      // A2: reset now — the running turn has ended and this prompt is taking
+      // over the stream (handoff). Resetting at entry would have zeroed that
+      // turn's usage while we were still parked behind it.
+      session.accumulatedUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      };
     } else {
+      // Fresh turn taking the stream immediately: reset before pushing so no
+      // concurrently-read result can be zeroed after it is counted.
+      session.accumulatedUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      };
       session.input.push(userMessage);
     }
 
@@ -883,11 +983,19 @@ export class ClaudeAcpAgent implements Agent {
     let lastThinkingTokensAt = 0;
     let lastThinkingTokensValue = -1;
 
-    /** Waits for the background reader loop to deliver the next SDK message. */
-    const nextMessage = (): Promise<SDKMessage | null> =>
-      new Promise((resolve) => {
+    /** Waits for the background reader loop to deliver the next SDK message.
+     *  Drains any messages the reader buffered while this loop was mid-`await`
+     *  (A1) before parking. FIFO is structurally guaranteed: the reader only
+     *  buffers when no resolver is parked, and this loop never parks while the
+     *  buffer is non-empty — single event loop, no interleaving window. */
+    const nextMessage = (): Promise<SDKMessage | null> => {
+      if (session.pendingSdkMessages.length > 0) {
+        return Promise.resolve(session.pendingSdkMessages.shift() ?? null);
+      }
+      return new Promise((resolve) => {
         session.activePromptResolve = resolve;
       });
+    };
 
     // Turn no-activity surfacing (CONCEPTION §3) + optional Tier-1 self-abort
     // (§4.3). Reset on every delivered message; if WEDGE_DISPLAY_MS elapses with
@@ -1155,8 +1263,67 @@ export class ClaudeAcpAgent implements Agent {
               case "api_retry":
               case "mirror_error":
               case "permission_denied":
+              case "commands_changed":
+                // `commands_changed` (new in the bundled CC ≥2.1.157): the SDK
+                // pushes the full slash-command list after a mid-session change
+                // (e.g. skills discovered dynamically while working in a
+                // subdirectory). We snapshot commands once at init and surface
+                // them via `sendAvailableCommandsUpdate`; live re-sync of the
+                // command palette is not yet wired through ACP, so this is an
+                // intentional no-op. No client-visible regression — the init
+                // command list stays valid; commands discovered mid-session
+                // simply aren't advertised until the next session load.
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "model_refusal_fallback": {
+                // New in the bundled CC ≥2.1.157. The active model refused this
+                // turn and the SDK transparently fell back to another model
+                // (`direction`: retry/revert/sticky). The refused partial was
+                // already streamed to the client as append-only
+                // `agent_message_chunk` text; `retracted_message_uuids` names the
+                // SDK wire uuids the engine has now evicted so they aren't shown
+                // as a real answer.
+                //
+                // The adapter streams assistant text WITHOUT exposing the SDK
+                // wire uuids to the client, so a generic ACP client cannot today
+                // key off `retracted_message_uuids` to evict the stale partial.
+                // We therefore (a) log the fallback richly for operability — this
+                // SDK drives every Claude session on the box, not just fable — and
+                // (b) propagate the full retraction record out-of-band via an
+                // `extNotification`, so a client that tracks message identity (or
+                // a future adapter change that tags chunks with uuids) can act on
+                // it. `extNotification` is non-invasive: clients that don't handle
+                // the method ignore it, so there is no transcript pollution or
+                // regression for existing clients.
+                const retracted = message.retracted_message_uuids ?? [];
+                this.logger.error(
+                  `Session ${message.session_id}: model_refusal_fallback ` +
+                    `(${message.direction}) ${message.original_model} -> ` +
+                    `${message.fallback_model}` +
+                    (message.api_refusal_category
+                      ? ` [category: ${message.api_refusal_category}]`
+                      : "") +
+                    `; retracted ${retracted.length} message(s).`,
+                );
+                await this.client
+                  .extNotification(MODEL_REFUSAL_FALLBACK_NOTIFICATION, {
+                    sessionId: message.session_id,
+                    direction: message.direction,
+                    originalModel: message.original_model,
+                    fallbackModel: message.fallback_model,
+                    apiRefusalCategory: message.api_refusal_category ?? null,
+                    apiRefusalExplanation: message.api_refusal_explanation ?? null,
+                    retractedMessageUuids: retracted,
+                    content: message.content,
+                  })
+                  .catch((err) => {
+                    this.logger.error(
+                      "Failed to forward model_refusal_fallback notification:",
+                      err,
+                    );
+                  });
+                break;
+              }
               case "thinking_tokens": {
                 // A running token-count *estimate* the SDK digests from thinking
                 // pings (`estimated_tokens`) — not thinking text. On redacted-
@@ -1600,26 +1767,68 @@ export class ClaudeAcpAgent implements Agent {
       session.activePromptResolve = null;
 
       if (!handedOff) {
-        session.promptRunning = false;
         if (errored) {
-          // The query stream was just drained — handing pending prompts off
-          // onto it would let them race with the recovery. Cancel them so
-          // each waiting prompt() returns stopReason: "cancelled" and the
-          // client can decide whether to retry.
+          session.promptRunning = false;
+          // The query stream was just drained — handing pending prompts or
+          // buffered messages off onto it would let them race with the recovery.
+          // Discard the buffer and cancel the pendings so each waiting prompt()
+          // returns stopReason: "cancelled" and the client can decide to retry.
+          session.pendingSdkMessages.length = 0;
           for (const pending of session.pendingMessages.values()) {
             pending.resolve(true);
           }
           session.pendingMessages.clear();
-        } else if (session.pendingMessages.size > 0) {
-          // This usually should not happen, but in case the loop finishes
-          // without claude sending all message replays, we resolve the
-          // next pending prompt call to ensure no prompts get stuck.
-          const next = [...session.pendingMessages.entries()].sort(
-            (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
+        } else {
+          // Clean exit (idle-status return, or stream end without error). Drain
+          // any messages the reader buffered after the loop stopped parking (A1
+          // lifecycle rule): a buffered user-replay whose uuid matches a parked
+          // prompt hands the stream to that prompt (same as the mid-loop handoff
+          // at :1517) and leaves the rest of the buffer for its successor;
+          // anything else is a genuine inter-turn update routed to idle handling.
+          let drainedHandoff = false;
+          while (session.pendingSdkMessages.length > 0) {
+            const buffered = session.pendingSdkMessages.shift();
+            if (!buffered) continue; // null sentinel — stream end, nothing to route
+            if (
+              buffered.type === "user" &&
+              "uuid" in buffered &&
+              buffered.uuid &&
+              session.pendingMessages.has(buffered.uuid as string)
+            ) {
+              const uuid = buffered.uuid as string;
+              const pending = session.pendingMessages.get(uuid)!;
+              pending.resolve(false);
+              session.pendingMessages.delete(uuid);
+              // `drainedHandoff` (not `handedOff`) gates the promptRunning
+              // clear below; the successor keeps ownership + the remaining buffer.
+              drainedHandoff = true;
+              break;
+            }
+            if (
+              session.emitRawSDKMessages &&
+              shouldEmitRawMessage(session.emitRawSDKMessages, buffered)
+            ) {
+              await this.client.extNotification("_claude/sdkMessage", {
+                sessionId: params.sessionId,
+                message: buffered as Record<string, unknown>,
+              });
+            }
+            await this.handleIdleMessage(buffered, params.sessionId);
+          }
+          if (!drainedHandoff) {
+            session.promptRunning = false;
+            // Last-resort band-aid retained: if the loop finished without the
+            // SDK replaying a still-parked prompt's message, release the oldest
+            // so it doesn't get stuck.
+            if (session.pendingMessages.size > 0) {
+              const next = [...session.pendingMessages.entries()].sort(
+                (a, b) => a[1].order - b[1].order,
+              )[0];
+              if (next) {
+                next[1].resolve(false);
+                session.pendingMessages.delete(next[0]);
+              }
+            }
           }
         }
       }
@@ -1636,6 +1845,10 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
+    // Discard any buffered mid-await SDK messages (A1 lifecycle rule): cancel
+    // throws away in-flight turn state, mirroring the query.interrupt() stale
+    // stream-drain below. teardownSession() reaches this via cancel() too.
+    session.pendingSdkMessages.length = 0;
     // Cancel hygiene (CONCEPTION §4.6): also unblock the ACTIVE prompt loop's
     // pending `nextMessage()` so it observes `cancelled`, returns
     // `{stopReason:'cancelled'}`, and clears `promptRunning` in its finally.
@@ -1693,7 +1906,7 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    const session = this.sessions[params.sessionId];
+    const session = await this.resolveSessionForConfigOp(params.sessionId);
     if (!session) {
       throw new Error("Session not found");
     }
@@ -1702,12 +1915,28 @@ export class ClaudeAcpAgent implements Agent {
     // silently dropped.
     const resolved = resolveModelPreference(session.modelInfos, params.modelId);
     const modelId = resolved?.value ?? params.modelId;
-    await session.query.setModel(modelId);
-    await this.updateConfigOption(params.sessionId, "model", modelId);
+    // Re-attach an explicit `[1m]` context hint the base ModelInfo dropped, so
+    // the binary receives e.g. "sonnet[1m]" (strips the suffix + enables the
+    // long-context beta) instead of the stripped "sonnet" (which runs at 200k).
+    // Storing the `[1m]` form as currentModelId also makes the reported window
+    // 1M (inferContextWindowFromModel matches `\b1m\b`) and keeps the alias in
+    // the advertised set so acpx's exact-string replay gate accepts it on
+    // resume. A plain pick (no hint) is returned untouched.
+    const runModelId = effectiveRunModelId(params.modelId, modelId);
+    // When the selection is the synthesized box-default entry, the literal
+    // string "default" is NOT a real SDK model id — map it to the SDK's
+    // documented "use the default" (`setModel(undefined)`), the same reset the
+    // box-default path in getAvailableModels uses. A CONCRETE model
+    // (sonnet/haiku/opus/fable/...) still applies that exact value. We persist
+    // the resume-safe "default" id either way, never `undefined`.
+    const isBoxDefault =
+      resolved?.value === "default" || params.modelId === "" || params.modelId === "default";
+    await session.query.setModel(isBoxDefault ? undefined : runModelId);
+    await this.updateConfigOption(params.sessionId, "model", runModelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    if (!this.sessions[params.sessionId]) {
+    if (!(await this.resolveSessionForConfigOp(params.sessionId))) {
       throw new Error("Session not found");
     }
 
@@ -1719,7 +1948,7 @@ export class ClaudeAcpAgent implements Agent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
-    const session = this.sessions[params.sessionId];
+    const session = await this.resolveSessionForConfigOp(params.sessionId);
     if (!session) {
       throw new Error("Session not found");
     }
@@ -1760,24 +1989,33 @@ export class ClaudeAcpAgent implements Agent {
     // Use the canonical option value so downstream code always receives the
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
+    // Preserve an explicit `[1m]` context hint on a model pick — same rationale
+    // as unstable_setSessionModel: the resolved option value is the stripped
+    // base ("sonnet"), so forwarding it verbatim would run 200k despite a
+    // "sonnet[1m]" request. Re-attach the hint for the value applied to the SDK
+    // and stored as currentModelId; non-model options are unaffected.
+    const appliedValue =
+      params.configId === "model"
+        ? effectiveRunModelId(params.value, resolvedValue)
+        : resolvedValue;
 
     if (params.configId === "mode") {
-      await this.applySessionMode(params.sessionId, resolvedValue);
+      await this.applySessionMode(params.sessionId, appliedValue);
       await this.client.sessionUpdate({
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "current_mode_update",
-          currentModeId: resolvedValue,
+          currentModeId: appliedValue,
         },
       });
     } else if (params.configId === "model") {
-      await this.sessions[params.sessionId].query.setModel(resolvedValue);
+      await this.sessions[params.sessionId].query.setModel(appliedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
     // the same path.
 
-    await this.applyConfigOptionValue(params.sessionId, session, params.configId, resolvedValue);
+    await this.applyConfigOptionValue(params.sessionId, session, params.configId, appliedValue);
 
     return { configOptions: session.configOptions };
   }
@@ -2062,19 +2300,31 @@ export class ClaudeAcpAgent implements Agent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
     } else if (configId === "model") {
+      // Resolve the new model's `ModelInfo` once: its `description` feeds the
+      // context-window heuristic below, and `supportsAutoMode` the mode clamp.
+      // Tolerate a `[1m]` hint on `value` that the base entry lacks (mid-session
+      // switch to "sonnet[1m]" when modelInfos holds only the base "sonnet").
+      const newModelInfo = findModelInfoById(session.modelInfos, value);
       if (session.models.currentModelId !== value) {
         // The cached context window was learned for the previous model; reset
-        // to the new model's heuristic so mid-stream updates between now and
-        // the next `result` reflect the user's selection instead of the old
-        // model's window.
-        session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
+        // to the new model's window. If we have an authoritative window
+        // restored from a prior run (fix A) FOR THIS model, use it — a resume
+        // advertises one model then replays the pinned one, and without this
+        // the switch would clobber the restored 1M back to the plain-alias
+        // heuristic (200k). Otherwise fall back to the heuristic (passing the
+        // description so the 1M-context `default` is told apart from plain
+        // `opus`, which share a base model id), else DEFAULT.
+        session.contextWindowSize =
+          session.restoredContextWindow?.modelId === value
+            ? session.restoredContextWindow.size
+            : (inferContextWindowFromModel(value, newModelInfo?.description) ??
+              DEFAULT_CONTEXT_WINDOW);
       }
       session.models = { ...session.models, currentModelId: value };
 
       // Recompute availableModes for the new model and clamp the current
       // mode if the SDK no longer offers it (today: "auto" on Haiku).
       // `ModelInfo.supportsAutoMode` is the canonical SDK signal.
-      const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const newAvailableModes = buildAvailableModes(newModelInfo);
       // Capture BEFORE mutating session.modes so the log message reflects
       // the invalidated mode rather than "default".
@@ -2118,9 +2368,7 @@ export class ClaudeAcpAgent implements Agent {
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(newEffort),
-        });
+        await applyEffortToSdk(session.query, newEffort);
       }
 
       // Emit current_mode_update only after session.modes AND
@@ -2143,11 +2391,64 @@ export class ClaudeAcpAgent implements Agent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
       if (configId === "effort") {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(value),
-        });
+        await applyEffortToSdk(session.query, value);
       }
     }
+  }
+
+  /**
+   * Resolve the in-memory session for a per-session config op (set_model /
+   * set_mode / set_config_option), lazily resuming a forked session that acpx
+   * minted out-of-band and never registered here (see `lastForkContext`).
+   *
+   * acpx's Claude copy path replaces our fork id with its own durable forked
+   * transcript id, then calls these ops on that id over the same connection
+   * with no preceding `session/resume`. The durable transcript exists on disk,
+   * so we resume it here using the originating fork's cwd/mcpServers/_meta.
+   *
+   * Returns undefined only for a genuinely-unknown id (no `lastForkContext`) —
+   * callers surface the usual "Session not found", so that case behaves as
+   * before. But when a lazy resume-from-disk actually THROWS, we now re-throw
+   * the underlying error instead of collapsing it to undefined. Previously the
+   * throw was swallowed and callers reported an opaque "Session not found",
+   * hiding the real reason — which made non-default-model fork creation fail
+   * with no diagnosable cause (fork brick 29efbe0c). Surfacing the error lets it
+   * reach acpx/the UI.
+   */
+  private async resolveSessionForConfigOp(sessionId: string): Promise<Session | undefined> {
+    const existing = this.sessions[sessionId];
+    if (existing) {
+      return existing;
+    }
+    const ctx = this.lastForkContext;
+    if (!ctx) {
+      return undefined;
+    }
+    try {
+      // TODO(fork brick 29efbe0c, staging step-0): `ctx.cwd` is the fork
+      // *request* cwd. For a cross-cwd Claude copy that is the SOURCE cwd, while
+      // acpx materializes the durable transcript at the DESTINATION cwd — so this
+      // resume can look in the wrong project dir (candidate cause "B1"). Not
+      // changed here because it is unconfirmed: the staging step-0 adapter log
+      // (this catch's error line) must first show whether the throw is B1 (cwd),
+      // B2 (config-dir/subscription) or B3 (transcript not resumable). Do not
+      // guess the cwd change before that evidence.
+      await this.getOrCreateSession({
+        sessionId,
+        cwd: ctx.cwd,
+        mcpServers: ctx.mcpServers,
+        additionalDirectories: ctx.additionalDirectories,
+        _meta: ctx._meta,
+      });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: lazy resume of forked session failed:`, error);
+      const detail = error instanceof Error ? error.message : String(error);
+      throw RequestError.internalError(
+        undefined,
+        `Failed to resume forked session ${sessionId} for config op: ${detail}`,
+      );
+    }
+    return this.sessions[sessionId];
   }
 
   private async getOrCreateSession(params: {
@@ -2349,6 +2650,30 @@ export class ClaudeAcpAgent implements Agent {
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
+    // Fix A (resume): an authoritative context window learned by a prior run
+    // of this session, round-tripped back in by acpx so a restored session
+    // reports the correct window from its first mid-stream update instead of
+    // re-guessing. Guard to a positive finite number; a bad/zero hint is
+    // ignored and we fall back to the heuristic.
+    const contextWindowHint = sessionMeta?.claudeCode?.contextWindowSizeHint;
+    const restoredContextWindowHint =
+      typeof contextWindowHint === "number" &&
+      Number.isFinite(contextWindowHint) &&
+      contextWindowHint > 0
+        ? contextWindowHint
+        : null;
+    // The model the hint was learned for (fix A, model-aware): a resume may
+    // advertise a different model first and then replay the pinned one; tagging
+    // the restored window lets the model-switch branch re-apply it instead of
+    // clobbering it with the plain-alias heuristic.
+    const contextWindowHintModel = sessionMeta?.claudeCode?.contextWindowSizeHintModel;
+    const restoredContextWindow =
+      restoredContextWindowHint !== null &&
+      typeof contextWindowHintModel === "string" &&
+      contextWindowHintModel.length > 0
+        ? { size: restoredContextWindowHint, modelId: contextWindowHintModel }
+        : null;
+
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
       ? parseInt(process.env.MAX_THINKING_TOKENS, 10)
@@ -2356,6 +2681,27 @@ export class ClaudeAcpAgent implements Agent {
 
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
+
+    // Resolve a concrete, non-"default" effort pin known at creation. Injecting
+    // it as a FLAG-tier `env` block (via the creation `settings` option below)
+    // makes the pin win from TURN 1 — otherwise the box's user-tier
+    // `CLAUDE_CODE_EFFORT_LEVEL` env would beat it on the first turn (the
+    // runtime `applyEffortToSdk` only lands from the turn it is applied). See
+    // `applyEffortToSdk` / brick 5f35da58. Pin-gated: unset when unpinned.
+    // `effortLevel` from resolved settings is the SDK union or undefined (never
+    // "default"/"max"), so any string here is a concrete pin.
+    const pinnedEffort = settingsManager.getSettings().effortLevel;
+    const effortEnv = pinnedEffort ? { CLAUDE_CODE_EFFORT_LEVEL: pinnedEffort } : undefined;
+    // Merge the modelConfig-derived settings and the effort-pin `env` into a
+    // single flag-tier `settings` object so the two don't clobber each other
+    // (both live under the one `settings` key). Applied only when the caller
+    // didn't supply its own `settings` via _meta — the caller keeps full
+    // control, matching the modelConfig precedence rule.
+    const creationSettings: Settings = {};
+    if (modelConfig?.modelOverrides) creationSettings.modelOverrides = modelConfig.modelOverrides;
+    if (modelConfig?.availableModels)
+      creationSettings.availableModels = modelConfig.availableModels;
+    if (effortEnv) creationSettings.env = effortEnv;
 
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
@@ -2380,17 +2726,13 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
-      // CLAUDE_MODEL_CONFIG env var is a fallback for model
-      // configuration (e.g. Bedrock model ID overrides). When the caller
-      // provides settings via _meta, we intentionally ignore the env var —
-      // the caller is assumed to have full control over model configuration.
+      // CLAUDE_MODEL_CONFIG env var is a fallback for model configuration
+      // (e.g. Bedrock model ID overrides), and the effort-pin `env` block makes
+      // a pinned reasoning effort win from turn 1 (see `creationSettings`).
+      // When the caller provides settings via _meta, we intentionally ignore
+      // both — the caller is assumed to have full control over configuration.
       ...(!userProvidedOptions?.settings &&
-        modelConfig && {
-          settings: {
-            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
-            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
-          },
-        }),
+        Object.keys(creationSettings).length > 0 && { settings: creationSettings }),
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
@@ -2553,12 +2895,29 @@ export class ClaudeAcpAgent implements Agent {
     // returned `resolvedModelInfos` — not the pre-call `allowedModels` — for
     // every downstream model lookup so the stored `modelInfos`, advertised
     // ids, and `currentModelId` remain mutually consistent.
-    const { state: models, modelInfos: resolvedModelInfos } = await getAvailableModels(
+    const availableModels = await getAvailableModels(
       q,
       allowedModels,
       initializationResult.models,
       settingsManager,
       this.logger,
+    );
+
+    // Advertise the Claude "fable" model. The bundled Claude Code binary knows
+    // and can RUN fable for our Claude Max accounts, but a server-side launch
+    // gate hides it from the advertised model menu — so `initializationResult.
+    // models` never contains it, even on the latest SDK. Inject it here, after
+    // the SDK/allowlist list is resolved, so a generic ACP client (acpx) can
+    // pin `--model fable` and pass the client-side support gate. The injection
+    // runs on EVERY init — new AND resume — via the shared `createSession`
+    // path, which is exactly what keeps the advertised id the literal `fable`
+    // on resume (the SDK would otherwise surface the resolved concrete id
+    // `claude-fable-5`, drifting the advertised value and breaking the acpx
+    // replay gate — the failure mode `opus[1m]` hit). See `injectFableModel`.
+    const __fableInjected = injectFableModel(availableModels.state, availableModels.modelInfos);
+    const { state: models, modelInfos: resolvedModelInfos } = injectOpusModel(
+      __fableInjected.state,
+      __fableInjected.modelInfos,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
@@ -2608,16 +2967,18 @@ export class ClaudeAcpAgent implements Agent {
       settingsManager.getSettings().effortLevel,
     );
 
-    // Apply the initial effort level to the SDK so it matches the UI default
+    // Apply the initial effort level to the SDK so it matches the UI default.
+    // Pin-gated: only when a concrete, non-"default" effort is resolved at
+    // creation — unpinned sessions are left untouched so the box default
+    // governs. The creation `settings.env` below is the belt-and-suspenders
+    // for turn 1; this runtime apply covers the flag layer authoritatively.
     const initialEffort = configOptions.find((o) => o.id === "effort");
     if (
       initialEffort &&
       typeof initialEffort.currentValue === "string" &&
       initialEffort.currentValue !== "default"
     ) {
-      await q.applyFlagSettings({
-        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
-      });
+      await applyEffortToSdk(q, initialEffort.currentValue);
     }
 
     this.sessions[sessionId] = {
@@ -2643,9 +3004,18 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       activePromptResolve: null,
+      pendingSdkMessages: [],
       backgroundLoopError: null,
+      // Precedence: an authoritative window restored from a prior run of this
+      // session (fix A — acpx round-trips the last learned window on resume) >
+      // the positive heuristic (`[1m]`/`default`/`fable`) > DEFAULT. This is
+      // what makes a resumed 1M session report 1M from its first post-resume
+      // usage_update instead of re-guessing 200k.
       contextWindowSize:
-        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+        restoredContextWindowHint ??
+        inferContextWindowFromModel(models.currentModelId, currentModelInfo?.description) ??
+        DEFAULT_CONTEXT_WINDOW,
+      restoredContextWindow,
       taskState,
     };
 
@@ -2679,6 +3049,10 @@ export class ClaudeAcpAgent implements Agent {
               const resolve = session.activePromptResolve;
               session.activePromptResolve = null;
               resolve(null);
+            } else if (session.promptRunning) {
+              // Loop owns the stream but is mid-await: queue a null sentinel so
+              // its next park observes stream end (A1).
+              session.pendingSdkMessages.push(null);
             }
             break;
           }
@@ -2688,8 +3062,31 @@ export class ClaudeAcpAgent implements Agent {
             const resolve = session.activePromptResolve;
             session.activePromptResolve = null;
             resolve(value);
+          } else if (session.promptRunning) {
+            // A1: a prompt owns the stream but its loop is mid-await (no resolver
+            // parked). Buffer instead of routing to handleIdleMessage — which
+            // silently discarded turn-control messages and withheld the response
+            // (RCA §1.2). nextMessage() drains this at the next park. Buffer ALL
+            // message types: classification is where bugs live, and a buffered
+            // content chunk is simply processed milliseconds later, exactly as a
+            // parked-path delivery would be.
+            if (!session.backgroundLoopError) {
+              if (session.pendingSdkMessages.length >= MAX_PENDING_SDK_MESSAGES) {
+                // Overflow ⇒ the loop is wedged and the buffer is masking it.
+                // Loud failure: stage the error and queue a null sentinel so the
+                // loop terminates the turn through the existing error path.
+                session.backgroundLoopError = new Error(
+                  `Session ${sessionId}: buffered SDK message count exceeded ` +
+                    `${MAX_PENDING_SDK_MESSAGES}; terminating the turn instead of ` +
+                    `dropping messages.`,
+                );
+                session.pendingSdkMessages.push(null);
+              } else {
+                session.pendingSdkMessages.push(value);
+              }
+            }
           } else {
-            // Idle: emit raw SDK message if configured, then forward.
+            // Genuine inter-turn (idle) message: emit raw if configured, then forward.
             if (
               session.emitRawSDKMessages &&
               shouldEmitRawMessage(session.emitRawSDKMessages, value)
@@ -2704,12 +3101,15 @@ export class ClaudeAcpAgent implements Agent {
         }
       } catch (error) {
         // Claude process died — store error so the prompt can re-throw it.
-        session.backgroundLoopError =
-          error instanceof Error ? error : new Error(String(error));
+        session.backgroundLoopError = error instanceof Error ? error : new Error(String(error));
         if (session.activePromptResolve) {
           const resolve = session.activePromptResolve;
           session.activePromptResolve = null;
           resolve(null);
+        } else if (session.promptRunning) {
+          // Loop is mid-await: queue a null sentinel so its next park returns
+          // null and re-throws backgroundLoopError (A1).
+          session.pendingSdkMessages.push(null);
         }
       }
     };
@@ -3059,14 +3459,43 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
   return modes;
 }
 
-// Translate a UI effort value into the flag-layer payload. The SDK
-// shallow-merges `applyFlagSettings`, drops `undefined` during JSON transport,
-// and only clears a key when an explicit `null` is sent — see
-// `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
-// `"default"` sentinel and `undefined` (effort option absent for the model) to
-// `null` ensures any previously-applied flag is actually cleared.
-function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | null {
-  return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
+// Values the SDK `effortLevel` union can express. It notably omits "max" (an
+// acpx effort level), which is one reason the env path below is authoritative.
+function isSdkEffortLevel(value: string): value is "low" | "medium" | "high" | "xhigh" {
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
+
+// Apply a session's reasoning-effort pin so it actually wins at the harness.
+//
+// The box user settings inject `CLAUDE_CODE_EFFORT_LEVEL` via the settings `env`
+// block, and the harness re-applies that `env` block to its process env EVERY
+// turn. That env var is the TOP effort authority — above the flag-tier
+// `effortLevel` KEY — so a session's effort pin silently loses to the box
+// default (`high`) unless we fight env with env at a higher tier. We inject the
+// pin as a FLAG-tier `env` block (the highest user-controlled settings tier),
+// which overrides the user-tier env in the per-turn re-application. The env path
+// also accepts "max", which the SDK `effortLevel` union omits. (brick 5f35da58)
+//
+// `applyFlagSettings` shallow-merges top-level keys; `null` clears a key from
+// the flag layer, while `undefined` is dropped during JSON transport and has no
+// effect — so the no-pin path sends explicit `null`s to actually clear.
+async function applyEffortToSdk(query: Query, value: string | undefined): Promise<void> {
+  if (value === undefined || value === "default") {
+    // Unpinned / default: clear both the flag-layer env override and the
+    // effortLevel key so the box/user settings default keeps governing. `env`
+    // is a single top-level flag key and the adapter sets no other flag-env
+    // keys, so clearing the whole key is exact; read-modify-write if that ever
+    // changes.
+    await query.applyFlagSettings({ env: null, effortLevel: null });
+    return;
+  }
+  await query.applyFlagSettings({
+    // Authoritative: beats the re-applied user-tier env, and accepts "max".
+    env: { CLAUDE_CODE_EFFORT_LEVEL: value },
+    // Keep the effortLevel key coherent for label/clamp paths, but only for
+    // values the SDK union can express (it omits "max").
+    ...(isSdkEffortLevel(value) && { effortLevel: value }),
+  });
 }
 
 function buildConfigOptions(
@@ -3104,8 +3533,10 @@ function buildConfigOptions(
     },
   ];
 
-  // Add effort level option based on the currently selected model
-  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
+  // Add effort level option based on the currently selected model. Tolerate a
+  // `[1m]` hint on currentModelId that the base entry lacks (a mid-session
+  // switch stores "sonnet[1m]" while modelInfos may hold only "sonnet").
+  const currentModelInfo = findModelInfoById(modelInfos, models.currentModelId);
   const supportedLevels = currentModelInfo?.supportsEffort
     ? (currentModelInfo.supportedEffortLevels ?? [])
     : [];
@@ -3236,6 +3667,47 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
   return bestMatch;
 }
 
+/**
+ * Preserve an explicit `[1m]` (or other `[<n>m]`) context hint on the model id
+ * that is actually handed to the Claude Code binary via `query.setModel(...)`.
+ *
+ * `resolveModelPreference` matches the base `ModelInfo` for alias lookups and
+ * returns its bare `.value` ("sonnet"), dropping the `[1m]` suffix. But the
+ * binary is the authority on `[1m]`: it strips `(\[1m\])+$` itself and enables
+ * the long-context beta (`anthropic-beta: context-1m-2025-08-07`) for the base
+ * model. If we forward the stripped base, the binary runs the model at its 200k
+ * default even though the picker/label promised 1M — the exact defect this fixes.
+ *
+ * So: when the *requested* id carried a context hint, re-attach it to the
+ * resolved base (unless the base already carries one). A requested id WITHOUT a
+ * hint is returned untouched — we never fabricate long-context for a plain pick.
+ */
+export function effectiveRunModelId(requested: string, resolvedBase: string): string {
+  const hint = requested.match(MODEL_CONTEXT_HINT_PATTERN)?.[1];
+  if (!hint) return resolvedBase;
+  // The resolved base may ALREADY denote this context tier — either bracketed
+  // ("sonnet[1m]") or as a concrete id ("claude-opus-4-6-1m"). Both forms carry
+  // the hint as a `\b<hint>\b` token; don't double-append (a doubled suffix
+  // would defeat the binary's `(\[1m\])+$` strip and inferContextWindowFromModel
+  // already matches either form). `hint` is `\d+m`, so it is regex-safe.
+  if (new RegExp(`\\b${hint}\\b`, "i").test(resolvedBase)) return resolvedBase;
+  return `${resolvedBase}[${hint}]`;
+}
+
+/**
+ * Look up the `ModelInfo` for a stored/current model id, tolerating a `[1m]`
+ * context hint the advertised base entry does not carry. A mid-session switch
+ * stores the `[1m]` run value as `currentModelId` (so the reported window is
+ * 1M), but `session.modelInfos` may hold only the base entry (e.g. a session
+ * started on "default" then switched to "sonnet[1m]"). Fall back to the alias
+ * resolver so effort/mode gating keeps keying on the base model's capabilities.
+ */
+function findModelInfoById(modelInfos: ModelInfo[], id: string): ModelInfo | undefined {
+  return (
+    modelInfos.find((m) => m.value === id) ?? resolveModelPreference(modelInfos, id) ?? undefined
+  );
+}
+
 function resolveSettingsModel(
   models: ModelInfo[],
   settingsModel: unknown,
@@ -3250,6 +3722,131 @@ function resolveSettingsModel(
     return null;
   }
   return resolveModelPreference(models, settingsModel);
+}
+
+/** Advertised id / alias for the Claude "fable" model. The bundled Claude Code
+ *  binary resolves this alias to the concrete `claude-fable-5` (CC ≥2.1.172),
+ *  so clients pin the stable `fable` while the SDK runs `claude-fable-5`. */
+const FABLE_MODEL_ID = "fable";
+const OPUS_MODEL_ID = "opus";
+
+/**
+ * The modern Claude reasoning-effort ladder that Fable 5 and Opus 4.x fully
+ * support (verified against the claude-api skill: low/medium/high/xhigh/max, GA).
+ *
+ * Both `fable` and `opus` are INJECTED into the advertised model list (the SDK
+ * never surfaces `fable`, and `opus` only when the resolved list lacks it), so —
+ * unlike SDK-surfaced models, which arrive with their effort capability already
+ * populated — the injected `ModelInfo` must supply it. Advertising this ladder is
+ * what keeps the effort config option alive across a mid-session switch to fable
+ * or opus, so `setSessionConfigOption("effort", ...)` succeeds instead of
+ * throwing "Unknown config option: effort" (surfaced to the user as an "internal
+ * error"). Shared by both injections to avoid drift. (brick 2a928fd7)
+ *
+ * Typed against the SDK union so any future divergence of the effort ladder is a
+ * compile error, not a silent mismatch with buildConfigOptions' label/clamp path.
+ */
+const INJECTED_MODEL_EFFORT_LEVELS: NonNullable<ModelInfo["supportedEffortLevels"]> = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/**
+ * Additively advertise the Claude "fable" model on top of the resolved
+ * SDK/allowlist model set.
+ *
+ * Why this is needed: the bundled Claude Code binary is entitled to RUN fable
+ * for our Claude Max accounts (forcing `--model claude-fable-5`/`fable` runs a
+ * turn), but a server-side launch gate omits fable from the advertised model
+ * menu — `initializationResult.models` / `supportedModels()` never list it,
+ * even on the latest SDK. The acpx client-side support gate
+ * (`assertRequestedModelSupported`) rejects any `--model` value the agent did
+ * not advertise, so without this injection `--model fable` cannot be selected.
+ *
+ * Properties (all required by the design):
+ * - **Additive** — the full base set (Default + sonnet/sonnet[1m]/haiku/
+ *   opus[1m], or whatever the SDK/allowlist resolved) is preserved untouched.
+ *   No restrict-list drift: if Anthropic adds or renames a base model it still
+ *   flows through.
+ * - **Idempotent** — a no-op if `fable` is already advertised. The SDK never
+ *   surfaces it today; a future SDK that does would not get a duplicate, and
+ *   we never collide with an existing entry (`resolveModelPreference(base,
+ *   "fable")` returns `null` against the base set — there is no fuzzy match
+ *   against sonnet/haiku/opus).
+ * - **Resume-stable** — because the caller runs this on EVERY init (new AND
+ *   resume, via the shared `createSession` path), the advertised id stays the
+ *   literal `fable` on reconnect. We never rely on the SDK to surface fable, so
+ *   unlike the removed `opus[1m]` the advertised value does not drift to the
+ *   resolved concrete id (`claude-fable-5`) on resume — which is what kept the
+ *   acpx replay gate accepting the persisted `fable` alias.
+ */
+export function injectFableModel(
+  state: SessionModelState,
+  modelInfos: ModelInfo[],
+): { state: SessionModelState; modelInfos: ModelInfo[] } {
+  if (modelInfos.some((m) => m.value === FABLE_MODEL_ID)) {
+    return { state, modelInfos };
+  }
+  const fableInfo: ModelInfo = {
+    value: FABLE_MODEL_ID,
+    displayName: "Fable",
+    description: "Fable (1M context)",
+    // Fable 5 supports the full reasoning-effort ladder. Without this the effort
+    // config option is dropped on a mid-session switch to fable, and the next
+    // effort set throws "Unknown config option: effort". (brick 2a928fd7)
+    supportsEffort: true,
+    supportedEffortLevels: INJECTED_MODEL_EFFORT_LEVELS,
+  };
+  return {
+    state: {
+      ...state,
+      availableModels: [
+        ...state.availableModels,
+        {
+          modelId: fableInfo.value,
+          name: fableInfo.displayName,
+          description: fableInfo.description,
+        },
+      ],
+    },
+    modelInfos: [...modelInfos, fableInfo],
+  };
+}
+
+export function injectOpusModel(
+  state: SessionModelState,
+  modelInfos: ModelInfo[],
+): { state: SessionModelState; modelInfos: ModelInfo[] } {
+  if (modelInfos.some((m) => m.value === OPUS_MODEL_ID)) {
+    return { state, modelInfos };
+  }
+  const opusInfo: ModelInfo = {
+    value: OPUS_MODEL_ID,
+    displayName: "Opus",
+    description: "Opus 4.8",
+    // Opus 4.x supports the full reasoning-effort ladder — same latent defect as
+    // fable: without this the effort option is dropped on a mid-session switch to
+    // opus and the next effort set throws. (brick 2a928fd7)
+    supportsEffort: true,
+    supportedEffortLevels: INJECTED_MODEL_EFFORT_LEVELS,
+  };
+  return {
+    state: {
+      ...state,
+      availableModels: [
+        ...state.availableModels,
+        {
+          modelId: opusInfo.value,
+          name: opusInfo.displayName,
+          description: opusInfo.description,
+        },
+      ],
+    },
+    modelInfos: [...modelInfos, opusInfo],
+  };
 }
 
 /**
@@ -3341,9 +3938,30 @@ async function getAvailableModels(
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const userInputWasFuzzyMatch =
     resolvedFromInput !== undefined && currentModel.value !== resolvedFromInput;
-  const skipSetModel = resolvedFromInput === undefined || (!userInputWasFuzzyMatch && sdkSawSameValue);
-  if (!skipSetModel) {
-    await query.setModel(currentModel.value);
+  if (resolvedFromInput === undefined) {
+    // Box-default config (no ANTHROPIC_MODEL / settings.model override). ACTIVELY
+    // reset the SDK to its own default model instead of skipping setModel. On
+    // session/new this is a no-op (the SDK is already on its default); on
+    // session/resume it CLEARS a `/model <x>` slash command the SDK persisted and
+    // replayed from the transcript, so the live serving model matches the
+    // advertised "default" (box default == Opus 4.8 / 1M) rather than a stale pin.
+    // The literal string "default" is NOT a real model id; `undefined` is the
+    // SDK's documented "use the default" (sdk.d.ts: setModel(model?: string) —
+    // "or undefined to use the default").
+    await query.setModel(undefined);
+  } else {
+    // Concrete override resolved from input: skip only when the SDK already landed
+    // on the exact same value (no fuzzy/alias rewrite). Unchanged from before.
+    const skipSetModel = !userInputWasFuzzyMatch && sdkSawSameValue;
+    if (!skipSetModel) {
+      // Preserve an explicit `[1m]` context hint from the resolved input so a
+      // session created/resumed on a "sonnet[1m]"/"opus[1m]" pin runs the
+      // long-context beta from the start. `resolveModelPreference` strips the
+      // suffix down to the base ModelInfo; the binary re-derives it. Without
+      // this the adapter advertises 1M (via the relabel below) while the SDK
+      // silently runs the base model at 200k.
+      await query.setModel(effectiveRunModelId(resolvedFromInput, currentModel.value));
+    }
   }
 
   // Keep the advertised model id STABLE for the user's pinned model across
@@ -3786,10 +4404,17 @@ export function toAcpNotifications(
                           parentToolUseId: options.parentToolUseId,
                           ...(options.subagentCache?.get(options.parentToolUseId)
                             ? {
-                                subagentId: options.subagentCache.get(options.parentToolUseId)!.agentId,
-                                subagentName: options.subagentCache.get(options.parentToolUseId)!.name,
-                                ...(options.subagentCache.get(options.parentToolUseId)!.color !== undefined
-                                  ? { subagentColor: options.subagentCache.get(options.parentToolUseId)!.color }
+                                subagentId: options.subagentCache.get(options.parentToolUseId)!
+                                  .agentId,
+                                subagentName: options.subagentCache.get(options.parentToolUseId)!
+                                  .name,
+                                ...(options.subagentCache.get(options.parentToolUseId)!.color !==
+                                undefined
+                                  ? {
+                                      subagentColor: options.subagentCache.get(
+                                        options.parentToolUseId,
+                                      )!.color,
+                                    }
                                   : {}),
                               }
                             : {}),
@@ -3970,13 +4595,26 @@ function commonPrefixLength(a: string, b: string) {
   return i;
 }
 
-/** Best-effort first guess of a model's context window from its ID, used only
- *  until a `result` message arrives with the authoritative `modelUsage` value.
- *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
- *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. */
-function inferContextWindowFromModel(model: string): number | null {
+/** Best-effort first guess of a model's context window, used only until a
+ *  `result` message arrives with the authoritative `modelUsage.contextWindow`.
+ *
+ *  Two pre-result signals, checked in order:
+ *  1. A `1m` token in the model ID — Anthropic's explicit 1M-context variants
+ *     and the `opus[1m]`/`sonnet[1m]` display aliases encode "1m" as a distinct
+ *     token (e.g. "claude-opus-4-6-1m"); `\b1m\b` catches it without also
+ *     matching "10m" or an embedded substring.
+ *  2. "1M context" in the model's `description`. This is the ONLY pre-result
+ *     signal that separates the box-default `default` model (Opus 4.8 *with 1M
+ *     context* → 1,000,000) from plain `opus` (Opus 4.8 → 200,000): both
+ *     resolve to the same base API model id (`claude-opus-4-8`), so the ID
+ *     alone cannot tell them apart. The model menu's own description carries
+ *     the distinction — the `default` ModelInfo reads "Opus 4.8 with 1M
+ *     context", while `opus`'s reads just "Opus 4.8" and stays at the default.
+ *     `description` is the SDK `ModelInfo.description` ("Description of the
+ *     model's capabilities"); there is no structured context-window field. */
+export function inferContextWindowFromModel(model: string, description?: string): number | null {
   if (/\b1m\b/i.test(model)) return 1_000_000;
+  if (description && /\b1m\b[\s_-]*context/i.test(description)) return 1_000_000;
   return null;
 }
 

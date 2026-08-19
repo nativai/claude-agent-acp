@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
@@ -439,6 +442,78 @@ describe("createSession options merging", () => {
       process.env.CLAUDE_MODEL_CONFIG = "not-json";
 
       await expect(agent.newSession({ cwd: "/test", mcpServers: [] })).rejects.toThrow();
+    });
+  });
+
+  // The effort pin must win from TURN 1, so a concrete effort resolved at
+  // creation is injected as a FLAG-tier `env` block via the creation `settings`
+  // option (the same tier as CLAUDE_MODEL_CONFIG). These tests use a real cwd
+  // whose `.claude/settings.json` carries a concrete `effortLevel`. (brick 5f35da58)
+  describe("effort pin creation settings", () => {
+    let tmpCwd: string;
+    let originalModelConfig: string | undefined;
+
+    beforeEach(() => {
+      originalModelConfig = process.env.CLAUDE_MODEL_CONFIG;
+      delete process.env.CLAUDE_MODEL_CONFIG;
+      tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "acp-effort-cwd-"));
+      fs.mkdirSync(path.join(tmpCwd, ".claude"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpCwd, ".claude", "settings.json"),
+        JSON.stringify({ effortLevel: "high" }),
+      );
+    });
+
+    afterEach(() => {
+      if (originalModelConfig !== undefined) {
+        process.env.CLAUDE_MODEL_CONFIG = originalModelConfig;
+      } else {
+        delete process.env.CLAUDE_MODEL_CONFIG;
+      }
+      fs.rmSync(tmpCwd, { recursive: true, force: true });
+    });
+
+    it("injects the pinned effort as a flag-tier env block at creation", async () => {
+      await agent.newSession({ cwd: tmpCwd, mcpServers: [] });
+
+      expect(capturedOptions!.settings).toEqual({
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
+      });
+    });
+
+    it("merges the effort env with CLAUDE_MODEL_CONFIG settings without clobbering", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+
+      await agent.newSession({ cwd: tmpCwd, mcpServers: [] });
+
+      // All three keys coexist under the single `settings` object — the effort
+      // env does not drop modelOverrides/availableModels, and vice-versa.
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
+      });
+    });
+
+    it("lets _meta-provided settings win (no effort env injected)", async () => {
+      await agent.newSession({
+        cwd: tmpCwd,
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              settings: { model: "claude-sonnet-4-6" },
+            },
+          },
+        },
+      });
+
+      // Caller keeps full control of `settings`; the adapter does not graft the
+      // effort env onto it.
+      expect(capturedOptions!.settings).toEqual({ model: "claude-sonnet-4-6" });
     });
   });
 
