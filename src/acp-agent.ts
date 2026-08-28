@@ -2574,9 +2574,24 @@ export class ClaudeAcpAgent implements Agent {
       // through `createSession` with the new value in its creation settings —
       // a resume rebuilds the system prompt while preserving the conversation
       // (measured: turn 2 adopts the style AND recalls turn 1, `session_id`
-      // unchanged; the negative control isolates the style as the cause). The
-      // forbidden half-applied state is unreachable BY CONSTRUCTION, because
-      // the call that reaches it does not exist — not by anyone remembering.
+      // unchanged; the negative control isolates the style as the cause).
+      //
+      // ⚠️ WHAT ACTUALLY HOLDS THIS LINE — corrected after an independent
+      // test-engineer falsified the earlier wording (brick 06af483a). This
+      // comment used to claim the forbidden state was "unreachable BY
+      // CONSTRUCTION, because the call that reaches it does not exist". THAT
+      // WAS FALSE, and it was the most dangerous sentence in the file, because
+      // a reader would have trusted it INSTEAD of reading the code:
+      // `query.applyFlagSettings` is a GENERIC SDK method with no key allowlist
+      // (as the paragraph below says), so it is always available. Declining to
+      // write an `applyOutputStyleToSdk` wrapper removes a CONVENIENCE, never
+      // the capability.
+      //
+      // What holds the line is TESTS, at both sites where the call can be
+      // written: `R-6 #1 ... NEVER pushes the style into the live query` here,
+      // and `R-6 #1 at the createSession/A8 site` there — each with a positive
+      // control proving the spy sees the call it forbids. If you are about to
+      // write the forbidden call, a test will stop you. Nothing else will.
       //
       // Two apply paths exist and neither is ours: the SDK `applyFlagSettings`
       // has no key allowlist (it would accept `outputStyle` and cause the above),
@@ -3249,7 +3264,17 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     // ⚠️ THE OUTPUT STYLE HAS NO COUNTERPART HERE, AND MUST NOT GROW ONE
-    // (brick 4d16ab8b A6/A8). Effort needs this runtime apply because its
+    // (brick 4d16ab8b A6/A8). This is the single highest-risk line in the
+    // feature — not because it is subtle, but because DESIGN row A8 ORIGINALLY
+    // TOLD YOU TO WRITE IT ("apply the initial style the same way the initial
+    // effort is applied", and the effort code right above is literally an
+    // `applyFlagSettings` call). That row has since been corrected, but a line
+    // the spec had to publicly take back is exactly the line a future reader
+    // will try to "restore". It is pinned by
+    // `R-6 #1 at the createSession/A8 site` in src/tests/output-style.test.ts;
+    // adding the call here turns those cases red.
+    //
+    // Effort needs this runtime apply because its
     // authority is an env var the harness re-applies every turn. The style does
     // not: it was folded into the flag-tier creation `settings` above, so the
     // fresh query composed its system prompt WITH the style and it is in force

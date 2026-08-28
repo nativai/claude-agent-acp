@@ -52,6 +52,15 @@ type InitResult = {
 
 let capturedOptions: Options | undefined;
 let mockInit: InitResult = {};
+/** Every `applyFlagSettings` payload the adapter pushed into the query DURING
+ *  SESSION CREATION. The creation path is a second site where the forbidden
+ *  live apply can be written, and it is not reachable from the setter-level
+ *  spy — an independent test-engineer found exactly that gap. */
+let creationFlagSettings: unknown[] = [];
+/** Drives `SettingsManager.getSettings().effortLevel`, which is what makes the
+ *  creation path apply an effort pin to the SDK. Off by default; the positive
+ *  control below turns it on to prove `creationFlagSettings` can see a call. */
+let mockEffortLevel: string | undefined;
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
@@ -59,6 +68,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   );
   return {
     ...actual,
+    // `SettingsManager` resolves the effective settings through this pair, so
+    // overriding them is how the effort pin is switched on for the control.
+    resolveSettings: async () => ({ effective: {} }),
+    filterEscalatingDefaultMode: () => (mockEffortLevel ? { effortLevel: mockEffortLevel } : {}),
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return {
@@ -69,13 +82,20 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
               displayName: "Claude Sonnet",
               description: "Fast",
               supportsAutoMode: true,
+              // Effort-capable, so the creation path has an effort pin it CAN
+              // apply — which is what gives the prohibition below a positive
+              // control at the very same site.
+              supportsEffort: true,
+              supportedEffortLevels: ["low", "medium", "high"],
             },
           ],
           ...mockInit,
         }),
         setModel: async () => {},
         setPermissionMode: async () => {},
-        applyFlagSettings: async () => {},
+        applyFlagSettings: async (settings: unknown) => {
+          creationFlagSettings.push(settings);
+        },
         supportedCommands: async () => [],
         [Symbol.asyncIterator]: async function* () {},
       };
@@ -108,6 +128,8 @@ describe("output style (U1)", () => {
 
   beforeEach(async () => {
     capturedOptions = undefined;
+    creationFlagSettings = [];
+    mockEffortLevel = undefined;
     // Default to the measured production response.
     mockInit = { output_style: "default", available_output_styles: [...BUILT_IN_STYLES] };
 
@@ -186,6 +208,37 @@ describe("output style (U1)", () => {
       expect(capturedSettings()?.outputStyle).toBe("explanatory");
     });
 
+    it('⚠️ R-6 #2: the literal "default" is EMITTED — absent and "default" are DIFFERENT states', async () => {
+      // The two halves live in ONE case so they cannot drift apart, because the
+      // property is a DISTINCTION and half of it is not a weaker version of it
+      // — it is a different claim. Collapsing them typechecked and passed the
+      // whole suite until this case existed (found by an independent TE).
+      //
+      // absent      = "whatever the settings cascade resolves"
+      // "default"   = an explicit pin to the harness default
+      //
+      // And `"default"` is THE CLEARING MECHANISM (`null` cannot reach the
+      // create-time flag slot at all). So if the adapter dropped `"default"` as
+      // though it were absent, clearing a style would launch the resumed session
+      // with the key absent, a user/project `settings.json` carrying an
+      // `outputStyle` would win, and CLEARING WOULD SILENTLY STOP CLEARING —
+      // with the record, the CLI and the header all still reporting `default`.
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { claudeCode: { outputStyle: "default" } },
+      });
+      expect(capturedSettings()?.outputStyle).toBe("default");
+
+      // Paired control on the same assertion surface: asking for nothing must
+      // NOT produce the key. If this half ever stops holding, the case above
+      // could pass by emitting "default" unconditionally.
+      capturedOptions = undefined;
+      await agent.newSession({ cwd: "/test-absent", mcpServers: [] });
+      expect(capturedSettings()?.outputStyle).toBeUndefined();
+      expect(Object.keys(capturedSettings() ?? {})).not.toContain("outputStyle");
+    });
+
     it("ignores an empty or whitespace-only style", async () => {
       await agent.newSession({
         cwd: "/test",
@@ -214,6 +267,85 @@ describe("output style (U1)", () => {
 
       expect(capturedSettings()?.outputStyle).toBe("Learning");
       expect(capturedSettings()?.env).toBeUndefined();
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // R-6 inversion #1, AT THE CREATION SITE.
+  //
+  // There are TWO places the forbidden live apply can be written, and the
+  // setter-level lock further down covers only one of them. This block covers
+  // the other: the `createSession` initialisation site, immediately after
+  // `applyEffortToSdk(q, initialEffort.currentValue)`.
+  //
+  // ⚠️ It is the highest-risk line in the whole feature, for a reason that has
+  // nothing to do with how subtle it is: DESIGN row A8 originally SAID to do it
+  // ("apply the initial style the same way the initial effort is applied" — and
+  // the effort code at that site is literally an `applyFlagSettings` call). The
+  // row has since been corrected, but the one line the spec had to publicly
+  // take back is exactly the line a future reader is most likely to "restore".
+  // Until these cases existed, writing that call passed all 397 tests.
+  // ------------------------------------------------------------------
+  describe("R-6 #1 at the createSession/A8 site", () => {
+    it("NEVER pushes an outputStyle into the live query during session creation", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { claudeCode: { outputStyle: "Explanatory" } },
+      });
+
+      // Assert on the KEY, not on the call count: the creation path legitimately
+      // calls applyFlagSettings for the effort pin, so "never called" would be
+      // both wrong and fragile. What must never happen is an `outputStyle` key
+      // reaching the LIVE flag slot — a different slot from the create-time one,
+      // and the one whose config moves while the system prompt stays frozen.
+      const withStyleKey = creationFlagSettings.filter(
+        (s) => typeof s === "object" && s !== null && "outputStyle" in s,
+      );
+      expect(withStyleKey).toEqual([]);
+    });
+
+    it("also never pushes one when the harness REPORTS a style we did not request", async () => {
+      // The other tempting variant: applying `initializationResult.output_style`
+      // back into the query "to make sure it took". Same prohibition.
+      mockInit = { output_style: "Learning", available_output_styles: [...BUILT_IN_STYLES] };
+
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      const withStyleKey = creationFlagSettings.filter(
+        (s) => typeof s === "object" && s !== null && "outputStyle" in s,
+      );
+      expect(withStyleKey).toEqual([]);
+    });
+
+    it("POSITIVE CONTROL: the creation path DOES reach the live query, for effort", async () => {
+      // Without this, both prohibitions above pass just as well against a spy
+      // that is not wired to anything — which is precisely how a prohibition
+      // becomes decorative. This proves `creationFlagSettings` observes calls
+      // made at the very site under prohibition, on the same code path, in the
+      // same entry point.
+      //
+      // Scope, so nobody over-reads it: the effort pin here is FORCED by the
+      // harness (`mockEffortLevel` drives the mocked settings resolution). On
+      // this box the real pin arrives as `env.CLAUDE_CODE_EFFORT_LEVEL` rather
+      // than the `effortLevel` key, so production may well make no call at this
+      // site at all. That does not weaken the control — its job is to show the
+      // spy CAN see a call here, not to claim one always happens.
+      mockEffortLevel = "high";
+
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { claudeCode: { outputStyle: "Explanatory" } },
+      });
+
+      expect(creationFlagSettings.length).toBeGreaterThan(0);
+      // ...and even with the spy demonstrably live and a style requested, no
+      // call carries an outputStyle key.
+      const withStyleKey = creationFlagSettings.filter(
+        (s) => typeof s === "object" && s !== null && "outputStyle" in s,
+      );
+      expect(withStyleKey).toEqual([]);
     });
   });
 
