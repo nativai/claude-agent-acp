@@ -211,6 +211,25 @@ export const MODEL_REFUSAL_FALLBACK_NOTIFICATION = "_claude/modelRefusalFallback
  *  `session/update` and on the `PromptResponse`. */
 export const LAST_TURN_END_REASON_META_KEY = "_claude/lastTurnEndReason";
 
+/** ACP `session/set_config_option` id for the Claude Code output style.
+ *  Deliberately IDENTICAL to the SDK `Settings` key `outputStyle`, so no
+ *  mapping table exists anywhere to drift. acpx's `normalizeModeId` trims but
+ *  never lowercases, so the camelCase survives the round trip.
+ *  Design: https://acpx.devbox.nativai.de/?brick=4d16ab8b §3.1 */
+export const OUTPUT_STYLE_CONFIG_ID = "outputStyle";
+/** The harness's own id for "no style" — an ordinary advertised member of
+ *  `available_output_styles`, not a sentinel.
+ *
+ *  ⚠️ THIS IS HOW A STYLE IS CLEARED. `applyFlagSettings({outputStyle: null})`
+ *  — the documented general clear idiom, and what the sibling effort code uses
+ *  — CANNOT clear a style set at creation: create-time settings and live
+ *  `applyFlagSettings` occupy different slots in the flag tier (measured, brick
+ *  4b2844f6 runs D/E, reproduced at the config layer in PROBES P8/P9). Every
+ *  style we set arrives through the create-time/resume path, so `null` could
+ *  never reach it. Reverting to default = persist this literal id and let the
+ *  next resume compose it. */
+export const DEFAULT_OUTPUT_STYLE_ID = "default";
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -225,6 +244,12 @@ type Session = {
   models: SessionModelState;
   modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
+  /** Output styles the harness advertised at init (`available_output_styles`).
+   *  Kept so a rebuild of `configOptions` — which a model switch performs — can
+   *  re-emit the `outputStyle` option instead of silently dropping it. Empty
+   *  when the harness advertises none, in which case we advertise no option at
+   *  all (honest "unsupported" rather than an empty dropdown). */
+  availableOutputStyles: string[];
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
@@ -341,6 +366,28 @@ export type NewSessionMeta = {
      * replay clobbers the restored 1M back to the plain-alias heuristic (200k).
      */
     contextWindowSizeHintModel?: string;
+    /**
+     * Claude Code output style for this session — the harness setting that
+     * rewrites the assistant's system prompt to set role, tone and default
+     * format. An OPAQUE, non-empty string: the identifier is a style's `name:`
+     * frontmatter and MAY contain spaces (measured: "Nativai Probe Shared").
+     * Never a slug, enum, or filename, and never case-folded — the built-ins are
+     * `default` (lowercase) plus `Proactive`/`Explanatory`/`Learning`
+     * (capitalised), so folding either way breaks one end.
+     *
+     * Its own `_meta` field ON PURPOSE, NOT `options.settings`: the adapter
+     * drops its entire `creationSettings` object when the caller supplies
+     * `settings` (see the `!userProvidedOptions?.settings` guard in
+     * `createSession`), so routing the style through the caller-options
+     * passthrough would silently disable the reasoning-effort pin — a
+     * regression in an unrelated feature with no error anywhere.
+     *
+     * The adapter folds this into the flag-tier creation `settings` object, at
+     * session creation AND on resume/load, so the style is in force from turn 1.
+     * There is deliberately no mid-session apply — see `applyConfigOptionValue`.
+     * Design: https://acpx.devbox.nativai.de/?brick=4d16ab8b §2.3(e), §3.1.
+     */
+    outputStyle?: string;
   };
   additionalRoots?: string[];
 };
@@ -847,6 +894,16 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
+  /**
+   * `session/resume`. Together with `loadSession` below this is the seam the
+   * whole output-style LIVE control rests on (brick 4d16ab8b A6c): both funnel
+   * into `getOrCreateSession` → `createSession`, which composes
+   * `_meta.claudeCode.outputStyle` into the flag-tier creation settings. A
+   * resume carrying a changed style rebuilds the system prompt with it while
+   * preserving the conversation — measured, with a negative control, and
+   * `session_id` unchanged. There is no separate resume-time style path to
+   * maintain, and there must not become one.
+   */
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
@@ -2091,6 +2148,23 @@ export class ClaudeAcpAgent implements Agent {
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
     // the same path.
+    //
+    // `outputStyle` (brick 4d16ab8b A7/A9) deliberately adds NO branch here.
+    // Both halves it needs already exist generically and must stay that way:
+    //   • VALIDATION — the `validValue` lookup above rejects any value outside
+    //     the advertised `options`, i.e. outside the harness's own
+    //     `available_output_styles`. This is OUR guard and the only one there
+    //     is: Claude Code itself accepts an unknown style name and echoes it
+    //     back as active (measured, PROBES P3), so without this the CLI, the
+    //     record and the header would all claim a style the session does not
+    //     have. `setSessionConfigOption(outputStyle, "NoSuchStyle")` MUST throw.
+    //   • UNSUPPORTED AGENT — when the harness advertised no styles there is no
+    //     `outputStyle` entry, so the `!option` guard above throws
+    //     "Unknown config option: outputStyle". That refusal IS the honest
+    //     degradation contract; do not add a tolerance branch for it the way
+    //     `effort` has one (effort's exists for a resume race, not for this).
+    // The value is then recorded — and deliberately NOT applied to the live
+    // query — by `applyConfigOptionValue`; read its comment before changing it.
 
     await this.applyConfigOptionValue(params.sessionId, session, params.configId, appliedValue);
 
@@ -2433,11 +2507,19 @@ export class ClaudeAcpAgent implements Agent {
       const effortOpt = session.configOptions.find((o) => o.id === "effort");
       const currentEffort =
         typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+      // Carry the output style through the rebuild. `buildConfigOptions`
+      // reconstructs the whole list, so an option not passed back in is DROPPED
+      // — a model switch would otherwise silently un-advertise the style and
+      // every layer above would read the session as no longer supporting one.
+      const outputStyleOpt = session.configOptions.find((o) => o.id === OUTPUT_STYLE_CONFIG_ID);
+      const currentOutputStyle =
+        typeof outputStyleOpt?.currentValue === "string" ? outputStyleOpt.currentValue : undefined;
       session.configOptions = buildConfigOptions(
         session.modes,
         session.models,
         session.modelInfos,
         currentEffort,
+        { current: currentOutputStyle, available: session.availableOutputStyles },
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -2470,6 +2552,59 @@ export class ClaudeAcpAgent implements Agent {
       if (configId === "effort") {
         await applyEffortToSdk(session.query, value);
       }
+      // ⚠️⚠️ DO NOT ADD AN `outputStyle` BRANCH BESIDE THE `effort` ONE ABOVE.
+      // It looks exactly like the missing piece. It is the DEFECT.
+      // (brick 4d16ab8b A6/A7 · R-6 inversion #1 of 3.)
+      //
+      // Output style is otherwise a faithful copy of `effort`, and effort DOES
+      // apply live (`applyEffortToSdk`) — so writing
+      // `applyOutputStyleToSdk(session.query, value)` here is what a careful
+      // implementer copying the precedent will reach for. What it produces was
+      // measured (brick 4b2844f6, controls both ways): the CONFIG moves, the
+      // per-turn reminder moves — and the SYSTEM PROMPT stays FROZEN. The
+      // reminder carries the style's NAME plus "Remember to follow the specific
+      // guidelines for this style", never the style's INSTRUCTIONS, which live
+      // only in the system prompt. The model is then told it is operating in a
+      // style it has never been shown. That is not a no-op a warning label can
+      // cover; it is strictly WORSE than doing nothing, and no UI copy makes it
+      // honest.
+      //
+      // Updating `session.configOptions` above IS the whole job here. The style
+      // binds when acpx recycles the queue owner and the session resumes
+      // through `createSession` with the new value in its creation settings —
+      // a resume rebuilds the system prompt while preserving the conversation
+      // (measured: turn 2 adopts the style AND recalls turn 1, `session_id`
+      // unchanged; the negative control isolates the style as the cause).
+      //
+      // ⚠️ WHAT ACTUALLY HOLDS THIS LINE — corrected after an independent
+      // test-engineer falsified the earlier wording (brick 06af483a). This
+      // comment used to claim the forbidden state was "unreachable BY
+      // CONSTRUCTION, because the call that reaches it does not exist". THAT
+      // WAS FALSE, and it was the most dangerous sentence in the file, because
+      // a reader would have trusted it INSTEAD of reading the code:
+      // `query.applyFlagSettings` is a GENERIC SDK method with no key allowlist
+      // (as the paragraph below says), so it is always available. Declining to
+      // write an `applyOutputStyleToSdk` wrapper removes a CONVENIENCE, never
+      // the capability.
+      //
+      // What holds the line is TESTS, at both sites where the call can be
+      // written: `R-6 #1 ... NEVER pushes the style into the live query` here,
+      // and `R-6 #1 at the createSession/A8 site` there — each with a positive
+      // control proving the spy sees the call it forbids. If you are about to
+      // write the forbidden call, a test will stop you. Nothing else will.
+      //
+      // Two apply paths exist and neither is ours: the SDK `applyFlagSettings`
+      // has no key allowlist (it would accept `outputStyle` and cause the above),
+      // while the REPL / Remote-Control bridge hard-allowlists
+      // `apply_flag_settings` to {effortLevel, ultracode} and REJECTS
+      // `outputStyle` outright. Do not "fix" this comment by reaching for the
+      // bridge either. (A6b.)
+      //
+      // Nor confirm a style by reading `output_style` back (R-6 inversion #3):
+      // that echo lies in both directions — unvalidated on the way in (an
+      // unknown name is accepted and echoed, PROBES P3) and disconnected from
+      // behaviour on the way out (this very freeze). The trustworthy signal is
+      // that a fresh resume carried the value in its creation settings.
     }
   }
 
@@ -2539,6 +2674,19 @@ export class ClaudeAcpAgent implements Agent {
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
       if (fingerprint === existingSession.sessionFingerprint) {
+        // ⚠️ Short-circuit: the ALREADY-RUNNING query is returned untouched, so
+        // a `_meta.claudeCode.outputStyle` differing from the one this session
+        // was created with is NOT picked up here (brick 4d16ab8b A6c). That is
+        // correct for the shipped design and must not be "optimised": a style
+        // change binds by acpx persisting the option and TERMINATING the queue
+        // owner, which kills this adapter process too — the next prompt cold-
+        // spawns a fresh adapter, `this.sessions` is empty, and `createSession`
+        // composes the new style into a fresh query's system prompt. Making
+        // this path re-apply a changed style INSIDE a live process is the
+        // forbidden half-applied state (see `applyConfigOptionValue`), and
+        // adding the style to `computeSessionFingerprint` to force a teardown
+        // would recreate the SDK query on every reconnect whose caller happens
+        // to omit the field.
         return {
           sessionId: params.sessionId,
           modes: existingSession.modes,
@@ -2769,6 +2917,22 @@ export class ClaudeAcpAgent implements Agent {
     // "default"/"max"), so any string here is a concrete pin.
     const pinnedEffort = settingsManager.getSettings().effortLevel;
     const effortEnv = pinnedEffort ? { CLAUDE_CODE_EFFORT_LEVEL: pinnedEffort } : undefined;
+    // Output style (brick 4d16ab8b). Trim only — NEVER case-fold: `default` is
+    // lowercase while the other built-ins are capitalised, and custom styles are
+    // named by their `name:` frontmatter, spaces included.
+    //
+    // ⚠️ THIS IS THE ONLY PLACE THE STYLE REACHES CLAUDE CODE, and it is the
+    // seam the live control rests on. `createSession` is shared by newSession,
+    // fork, resumeSession and loadSession, so folding the style in here covers
+    // create AND resume in one site: a resume carrying a CHANGED style rebuilds
+    // the system prompt with it while preserving the conversation (measured,
+    // brick 4b2844f6 runs F1/F2, `session_id` unchanged, negative control
+    // green). Do not add a second apply path — see `applyConfigOptionValue`.
+    const rawOutputStyle = sessionMeta?.claudeCode?.outputStyle;
+    const requestedOutputStyle =
+      typeof rawOutputStyle === "string" && rawOutputStyle.trim().length > 0
+        ? rawOutputStyle.trim()
+        : undefined;
     // Merge the modelConfig-derived settings and the effort-pin `env` into a
     // single flag-tier `settings` object so the two don't clobber each other
     // (both live under the one `settings` key). Applied only when the caller
@@ -2779,6 +2943,9 @@ export class ClaudeAcpAgent implements Agent {
     if (modelConfig?.availableModels)
       creationSettings.availableModels = modelConfig.availableModels;
     if (effortEnv) creationSettings.env = effortEnv;
+    // Same object, one more key — NOT a second `settings` key (there is only one
+    // flag-tier slot, and a second would clobber the effort pin).
+    if (requestedOutputStyle) creationSettings.outputStyle = requestedOutputStyle;
 
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
@@ -2808,6 +2975,12 @@ export class ClaudeAcpAgent implements Agent {
       // a pinned reasoning effort win from turn 1 (see `creationSettings`).
       // When the caller provides settings via _meta, we intentionally ignore
       // both — the caller is assumed to have full control over configuration.
+      // ⚠️ This guard now gates THREE things, the output style included
+      // (brick 4d16ab8b A3): a caller supplying its own `settings` opts out of
+      // the model-config fallback, the effort pin AND `_meta.claudeCode.
+      // outputStyle`. That is the documented all-or-nothing contract, and it is
+      // exactly why the style travels as its own `_meta` field rather than
+      // through `options.settings`.
       ...(!userProvidedOptions?.settings &&
         Object.keys(creationSettings).length > 0 && { settings: creationSettings }),
       env: {
@@ -3037,11 +3210,43 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
+    // Output style, straight from the harness's own init handshake (A4). Both
+    // fields are optional here on purpose: an older CLI — or any harness that
+    // does not know the concept — simply omits them, and an empty
+    // `availableOutputStyles` makes `buildConfigOptions` advertise NO option at
+    // all, which is the honest "this session does not support styles" signal
+    // acpx and acpx-ui derive support from (never an agent-name allowlist).
+    const availableOutputStyles = Array.isArray(initializationResult.available_output_styles)
+      ? initializationResult.available_output_styles
+      : [];
+    const reportedOutputStyle =
+      typeof initializationResult.output_style === "string"
+        ? initializationResult.output_style
+        : undefined;
+    // ⚠️ Claude Code does NOT validate `outputStyle`: a bogus name is accepted
+    // and echoed straight back as the session's active style (measured, PROBES
+    // P3). So a mismatch here means a style we were asked for did not exist —
+    // the session is silently running the default while every surface would
+    // otherwise claim the requested style is set. Say so loudly; the clamp in
+    // `buildConfigOptions` keeps the ADVERTISED value honest.
+    if (
+      requestedOutputStyle &&
+      availableOutputStyles.length > 0 &&
+      !availableOutputStyles.includes(requestedOutputStyle)
+    ) {
+      this.logger.error(
+        `Session ${sessionId}: requested output style "${requestedOutputStyle}" is not one of ` +
+          `[${availableOutputStyles.join(", ")}]. Claude Code accepts unknown style names without ` +
+          `error, so this session is running the default prompt. Not advertising it as active.`,
+      );
+    }
+
     const configOptions = buildConfigOptions(
       modes,
       models,
       resolvedModelInfos,
       settingsManager.getSettings().effortLevel,
+      { current: reportedOutputStyle, available: availableOutputStyles },
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default.
@@ -3057,6 +3262,28 @@ export class ClaudeAcpAgent implements Agent {
     ) {
       await applyEffortToSdk(q, initialEffort.currentValue);
     }
+
+    // ⚠️ THE OUTPUT STYLE HAS NO COUNTERPART HERE, AND MUST NOT GROW ONE
+    // (brick 4d16ab8b A6/A8). This is the single highest-risk line in the
+    // feature — not because it is subtle, but because DESIGN row A8 ORIGINALLY
+    // TOLD YOU TO WRITE IT ("apply the initial style the same way the initial
+    // effort is applied", and the effort code right above is literally an
+    // `applyFlagSettings` call). That row has since been corrected, but a line
+    // the spec had to publicly take back is exactly the line a future reader
+    // will try to "restore". It is pinned by
+    // `R-6 #1 at the createSession/A8 site` in src/tests/output-style.test.ts;
+    // adding the call here turns those cases red.
+    //
+    // Effort needs this runtime apply because its
+    // authority is an env var the harness re-applies every turn. The style does
+    // not: it was folded into the flag-tier creation `settings` above, so the
+    // fresh query composed its system prompt WITH the style and it is in force
+    // from turn 1 — nothing is left to apply. Adding
+    // `await q.applyFlagSettings({ outputStyle: ... })` here would move the
+    // style into the LIVE flag slot, which is a DIFFERENT slot from the
+    // create-time one (measured, brick 4b2844f6 runs D/E) — and the live slot
+    // is the one that moves the config and the per-turn reminder while leaving
+    // the system prompt frozen. See `applyConfigOptionValue`.
 
     this.sessions[sessionId] = {
       query: q,
@@ -3075,6 +3302,7 @@ export class ClaudeAcpAgent implements Agent {
       models,
       modelInfos: resolvedModelInfos,
       configOptions,
+      availableOutputStyles,
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
@@ -3653,6 +3881,7 @@ function buildConfigOptions(
   models: SessionModelState,
   modelInfos: ModelInfo[],
   currentEffortLevel?: string,
+  outputStyles?: { current?: string; available?: string[] },
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -3715,6 +3944,49 @@ function buildConfigOptions(
       type: "select",
       currentValue: validEffort,
       options: effortOptions,
+    });
+  }
+
+  // Output style (brick 4d16ab8b A5/A9). Advertised ONLY when the harness
+  // enumerated at least one style. An empty list must advertise NOTHING: the
+  // advertisement IS the capability signal every other layer derives support
+  // from, so an empty dropdown would read as "supported, no choices" instead of
+  // "this harness has no output styles".
+  //
+  // ⚠️ The advertised `currentValue` is CLAMPED into the advertised list, and
+  // that is a hard requirement, not tidiness. Claude Code accepts an unknown
+  // style name and echoes it back as active (measured, PROBES P3), so the value
+  // arriving here is NOT guaranteed to be real. Advertising it verbatim would
+  // put a `currentValue` outside `options` on the wire — a control that reports
+  // a style the session does not have. Clamp to the harness default when the
+  // reported value is not a member; the caller logs the rejection.
+  //
+  // The list is never hardcoded: it is whatever this harness enumerated. On
+  // `claude 2.1.239` that is FOUR built-ins (`default`, `Proactive`,
+  // `Explanatory`, `Learning`) — `Concise` is documented upstream but absent
+  // here — plus any custom/house style files it discovered.
+  const availableStyles = outputStyles?.available ?? [];
+  if (availableStyles.length > 0) {
+    const reported = outputStyles?.current;
+    const currentStyle =
+      reported !== undefined && availableStyles.includes(reported)
+        ? reported
+        : (availableStyles.find((s) => s === DEFAULT_OUTPUT_STYLE_ID) ?? availableStyles[0]);
+
+    options.push({
+      id: OUTPUT_STYLE_CONFIG_ID,
+      name: "Output style",
+      description: "Response role, tone and format",
+      category: "mode",
+      type: "select",
+      currentValue: currentStyle,
+      options: availableStyles.map((style) => ({
+        value: style,
+        // The id IS the display name (a style's `name:` frontmatter). Do not
+        // title-case or otherwise rewrite it — `default` is deliberately
+        // lowercase and custom names carry their own capitalisation.
+        name: style,
+      })),
     });
   }
 
