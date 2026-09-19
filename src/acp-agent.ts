@@ -1535,6 +1535,9 @@ export class ClaudeAcpAgent implements Agent {
                     this.toolUseCache,
                     this.client,
                     this.logger,
+                    {
+                      claudeUuid: message.uuid,
+                    },
                   )) {
                     await this.client.sessionUpdate(notification);
                   }
@@ -1713,6 +1716,7 @@ export class ClaudeAcpAgent implements Agent {
                     parentToolUseId: message.parent_tool_use_id,
                     cwd: session.cwd,
                     taskState: session.taskState,
+                    claudeUuid: message.uuid,
                   },
                 )) {
                   await this.client.sessionUpdate(notification);
@@ -1776,9 +1780,44 @@ export class ClaudeAcpAgent implements Agent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 subagentCache: this.subagentCache,
+                claudeUuid: message.uuid,
               },
             )) {
               await this.client.sessionUpdate(notification);
+            }
+
+            // Live-streamed text/thinking content is delivered early via
+            // stream_event, before the real transcript uuid is known, so the
+            // consolidated message above has that content filtered back out
+            // and there is otherwise no notification where the correct uuid
+            // and outgoing content coincide. Send a trailing, content-free
+            // correction so acpx's last-write-wins claudeUuid stamping still
+            // lands the real uuid on the Agent entry the streamed content
+            // already populated.
+            if (
+              message.type === "assistant" &&
+              message.message.content.some(
+                (item) => item.type === "text" || item.type === "thinking",
+              )
+            ) {
+              for (const notification of toAcpNotifications(
+                "",
+                "assistant",
+                params.sessionId,
+                this.toolUseCache,
+                this.client,
+                this.logger,
+                {
+                  clientCapabilities: this.clientCapabilities,
+                  parentToolUseId: message.parent_tool_use_id,
+                  cwd: session.cwd,
+                  taskState: session.taskState,
+                  subagentCache: this.subagentCache,
+                  claudeUuid: message.uuid,
+                },
+              )) {
+                await this.client.sessionUpdate(notification);
+              }
             }
             break;
           }
@@ -2234,6 +2273,7 @@ export class ClaudeAcpAgent implements Agent {
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
+          claudeUuid: message.uuid,
         },
       )) {
         await this.client.sessionUpdate(notification);
@@ -3467,9 +3507,39 @@ export class ClaudeAcpAgent implements Agent {
             cwd: session.cwd,
             taskState: session.taskState,
             subagentCache: this.subagentCache,
+            claudeUuid: message.uuid,
           },
         )) {
           await this.client.sessionUpdate(notification);
+        }
+
+        // See the identical correction in the main prompt loop above: live
+        // text/thinking content streams before the real transcript uuid is
+        // known, so it's filtered out of the consolidated message here and
+        // needs a trailing, content-free notification to carry the uuid.
+        if (
+          message.message.content.some(
+            (item: any) => item.type === "text" || item.type === "thinking",
+          )
+        ) {
+          for (const notification of toAcpNotifications(
+            "",
+            "assistant",
+            sessionId,
+            this.toolUseCache,
+            this.client,
+            this.logger,
+            {
+              clientCapabilities: this.clientCapabilities,
+              parentToolUseId: message.parent_tool_use_id,
+              cwd: session.cwd,
+              taskState: session.taskState,
+              subagentCache: this.subagentCache,
+              claudeUuid: message.uuid,
+            },
+          )) {
+            await this.client.sessionUpdate(notification);
+          }
         }
         break;
       }
@@ -4584,6 +4654,7 @@ export function toAcpNotifications(
     cwd?: string;
     taskState?: TaskState;
     subagentCache?: Map<string, SubagentInfo>;
+    claudeUuid?: string;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -4613,6 +4684,12 @@ export function toAcpNotifications(
               }
             : {}),
         },
+      };
+    }
+    if (options?.claudeUuid) {
+      update._meta = {
+        ...update._meta,
+        claudeUuid: options.claudeUuid,
       };
     }
 
@@ -4931,6 +5008,12 @@ export function toAcpNotifications(
                 }
               : {}),
           },
+        };
+      }
+      if (options?.claudeUuid) {
+        update._meta = {
+          ...update._meta,
+          claudeUuid: options.claudeUuid,
         };
       }
       output.push({ sessionId, update });
