@@ -46,6 +46,27 @@ describe("authorization", () => {
     return [agent, mockQuery];
   }
 
+  // `initialize` picks its auth methods from an `isRemote` check over AMBIENT env
+  // vars (`isRemote` in ../acp-agent.ts): NO_BROWSER, SSH_CONNECTION, SSH_CLIENT,
+  // SSH_TTY or CLAUDE_CODE_REMOTE — any one of them collapses the list to the single
+  // legacy `claude-login` method. Our own test transport sets SSH_CONNECTION and
+  // SSH_CLIENT, because `workbench-exec` reaches the workbench over SSH. So a case
+  // asserting the NON-remote methods has to establish that precondition itself
+  // instead of inheriting the environment it happens to run in — otherwise it passes
+  // on a developer laptop and fails on the box we actually gate on.
+  //
+  // ⚠️ DO NOT "improve" this into a delete-list of the five names above. It looks
+  // tidier and it is the bug: an empty env is hermetic BY CONSTRUCTION, so a sixth
+  // marker added to `isRemote` is covered the day it lands, whereas a name list goes
+  // stale in silence and these cases start failing again only on hosts that set the
+  // new var. Returns a fresh object per call so a mutation cannot leak between cases.
+  //
+  // The opposite branch stays executable in the two `... falls back to single legacy
+  // login method` cases below, which SET a marker and assert `claude-login`.
+  function nonRemoteEnv(): Record<string, string | undefined> {
+    return {};
+  }
+
   it("gateway auth not offered without capability", async () => {
     const [agent] = await createAgentMock();
 
@@ -189,7 +210,7 @@ describe("authorization", () => {
 
   it("hide claude auth but still show console login when terminal-auth is set", async () => {
     const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
+    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"], env: nonRemoteEnv() });
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
@@ -207,7 +228,7 @@ describe("authorization", () => {
 
   it("hide claude auth but still show console login with terminal capability", async () => {
     const [agent] = await createAgentMock();
-    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
+    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"], env: nonRemoteEnv() });
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
@@ -283,6 +304,7 @@ describe("authorization", () => {
 
   it("show claude authentication", async () => {
     const [agent] = await createAgentMock();
+    vi.stubGlobal("process", { ...process, env: nonRemoteEnv() });
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
