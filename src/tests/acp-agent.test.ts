@@ -33,6 +33,8 @@ import {
   claudeCliPath,
   describeAlwaysAllow,
   inferContextWindowFromModel,
+  engineContextFromUsage,
+  CONTEXT_COMPACTION_META_KEY,
   streamEventToAcpNotifications,
   RESUME_HEARTBEAT_MS,
   INIT_HARD_MS,
@@ -2787,9 +2789,9 @@ describe("usage_update computation", () => {
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
     expect(usageUpdates[0].update.used).toBe(1800);
-    // First prompt of a session has no prior result to learn the window from,
-    // so the mid-stream update falls back to the default context window.
-    expect(usageUpdates[0].update.size).toBe(200000);
+    // First prompt of a session, no engine read and no prior result: the window
+    // is UNKNOWN and reported as 0 — never the 200k default (brick 4f3fa88c).
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[0].update.cost).toBeUndefined();
     expect(usageUpdates[1].update.used).toBe(1800);
     expect(usageUpdates[1].update.size).toBe(1000000);
@@ -2876,7 +2878,9 @@ describe("usage_update computation", () => {
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
+    // The heuristic still seeds the internal window, but a guess is never REPORTED:
+    // unconfirmed ⇒ 0 until the result confirms it (brick 4f3fa88c).
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
@@ -2921,8 +2925,11 @@ describe("usage_update computation", () => {
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    // The crux: the FIRST mid-stream update must already be 1M, not 200k.
-    expect(usageUpdates[0].update.size).toBe(1000000);
+    // The crux: the FIRST mid-stream update must never advertise 200k. Without the
+    // engine read it is UNKNOWN (0); with it, it is 1M from the first second — the
+    // "engine context read" rows below (brick 4f3fa88c).
+    expect(usageUpdates[0].update.size).not.toBe(200000);
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
     // Hint-poisoning guard: `session.contextWindowSize` is what acpx persists
     // and round-trips as `contextWindowSizeHint` on resume. It must never dip to
@@ -3006,8 +3013,9 @@ describe("usage_update computation", () => {
       }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
-    // Simulate a prior prompt having learned the 1M window for this model.
+    // Simulate a prior prompt having learned (confirmed) the 1M window for this model.
     agent.sessions["test-session"].contextWindowSize = 1000000;
+    agent.sessions["test-session"].contextWindowConfirmed = true;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -3063,7 +3071,9 @@ describe("usage_update computation", () => {
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
+    // The heuristic still seeds the internal window, but a guess is never REPORTED:
+    // unconfirmed ⇒ 0 until the result confirms it (brick 4f3fa88c).
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
@@ -3125,7 +3135,9 @@ describe("usage_update computation", () => {
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
+    // The heuristic still seeds the internal window, but a guess is never REPORTED:
+    // unconfirmed ⇒ 0 until the result confirms it (brick 4f3fa88c).
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
@@ -3275,7 +3287,8 @@ describe("usage_update computation", () => {
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(200000);
+    // After the switch the old window is UNKNOWN (0) until the result confirms 200k.
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(200000);
   });
 
@@ -3671,6 +3684,174 @@ describe("usage_update computation", () => {
     expect(usageUpdate).toBeDefined();
     // size should be 1000000 (Opus), not 200000 (the fallback if <synthetic> overrode the model)
     expect(usageUpdate.update.size).toBe(1000000);
+  });
+
+  describe("engine context read — window and compaction point from the engine (brick 4f3fa88c)", () => {
+    // Shapes as MEASURED on the engine (MEASUREMENT-ENGINE.md, 2026-10-07): 1M carries a
+    // buffer row, every 200k model does NOT — only autoCompactThreshold.
+    const ENGINE_1M = {
+      maxTokens: 1000000,
+      totalTokens: 0,
+      autoCompactThreshold: 967000,
+      isAutoCompactEnabled: true,
+      categories: [
+        { name: "Autocompact buffer", kind: "buffer" as const, tokens: 33000, color: "" },
+        { name: "Free space", kind: "free" as const, tokens: 967000, color: "" },
+      ],
+    };
+    const ENGINE_200K = {
+      maxTokens: 200000,
+      totalTokens: 0,
+      autoCompactThreshold: 167000,
+      isAutoCompactEnabled: true,
+      categories: [{ name: "Free space", kind: "free" as const, tokens: 200000, color: "" }],
+    };
+    const opusTurn = () => [
+      createStreamEvent("message_start", {
+        model: "claude-opus-5-5",
+        usage: {
+          input_tokens: 2000,
+          output_tokens: 1000,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-5-5": {
+            inputTokens: 2000,
+            outputTokens: 1000,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ];
+    function withEngine(agent: ClaudeAcpAgent, read: () => Promise<unknown>) {
+      const q = agent.sessions["test-session"].query as any;
+      q.getContextUsage = vi.fn(read);
+      return q.getContextUsage as ReturnType<typeof vi.fn>;
+    }
+    const usageOf = (updates: any[]) =>
+      updates
+        .filter((u: any) => u.update?.sessionUpdate === "usage_update")
+        .map((u: any) => u.update);
+
+    it("reads autoCompactThreshold; a 200k report has no buffer row and still yields 167,000", () => {
+      expect(engineContextFromUsage(ENGINE_1M)).toEqual({ window: 1000000, compactAt: 967000 });
+      expect(engineContextFromUsage(ENGINE_200K)).toEqual({ window: 200000, compactAt: 167000 });
+    });
+
+    it("falls back to window − buffer row only when the threshold is absent", () => {
+      expect(engineContextFromUsage({ ...ENGINE_1M, autoCompactThreshold: undefined })).toEqual({
+        window: 1000000,
+        compactAt: 967000,
+      });
+      expect(engineContextFromUsage({ ...ENGINE_200K, autoCompactThreshold: undefined })).toEqual({
+        window: 200000,
+        compactAt: null,
+      });
+    });
+
+    it("auto-compaction off ⇒ no compaction point; no window ⇒ nothing confirmed", () => {
+      expect(engineContextFromUsage({ ...ENGINE_1M, isAutoCompactEnabled: false })).toEqual({
+        window: 1000000,
+        compactAt: null,
+      });
+      expect(engineContextFromUsage({ ...ENGINE_1M, maxTokens: 0 })).toBeUndefined();
+    });
+
+    it("the session-start read reports the true window and compaction point BEFORE any turn, and every later update carries them", async () => {
+      const { agent, updates } = createMockAgentWithCapture();
+      injectSession(agent, opusTurn());
+      withEngine(agent, async () => ENGINE_1M);
+
+      await (agent as any).sendEngineContextUpdate("test-session");
+      const [start] = usageOf(updates);
+      expect(start).toEqual({
+        sessionUpdate: "usage_update",
+        used: 0,
+        size: 1000000,
+        _meta: { [CONTEXT_COMPACTION_META_KEY]: { atTokens: 967000 } },
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      const all = usageOf(updates);
+      expect(all).toHaveLength(3);
+      for (const update of all) {
+        expect(update.size).toBe(1000000);
+        expect(update._meta?.[CONTEXT_COMPACTION_META_KEY]).toEqual({ atTokens: 967000 });
+      }
+    });
+
+    it("a 200k engine reports 200,000 and compaction at 167,000", async () => {
+      const { agent, updates } = createMockAgentWithCapture();
+      injectSession(agent, []);
+      withEngine(agent, async () => ENGINE_200K);
+      await (agent as any).sendEngineContextUpdate("test-session");
+      expect(usageOf(updates)).toEqual([
+        {
+          sessionUpdate: "usage_update",
+          used: 0,
+          size: 200000,
+          _meta: { [CONTEXT_COMPACTION_META_KEY]: { atTokens: 167000 } },
+        },
+      ]);
+    });
+
+    it("unknown window ⇒ size 0 and no compaction point until something confirms it", async () => {
+      const { agent, updates } = createMockAgentWithCapture();
+      injectSession(agent, opusTurn());
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      const [midStream, result] = usageOf(updates);
+      expect(midStream.size).toBe(0);
+      expect(midStream._meta).toBeUndefined();
+      // The result confirms the window; it names no compaction point (only the engine does).
+      expect(result.size).toBe(1000000);
+      expect(result._meta?.[CONTEXT_COMPACTION_META_KEY]).toBeUndefined();
+    });
+
+    it("a failed engine read emits nothing and leaves the window unknown", async () => {
+      const { agent, updates } = createMockAgentWithCapture();
+      injectSession(agent, opusTurn());
+      withEngine(agent, async () => {
+        throw new Error("control request failed");
+      });
+      await (agent as any).sendEngineContextUpdate("test-session");
+      expect(usageOf(updates)).toEqual([]);
+      expect(agent.sessions["test-session"].contextWindowConfirmed).not.toBe(true);
+    });
+
+    it("a model switch forgets the engine reading and asks the engine again", async () => {
+      const { agent, updates } = createMockAgentWithCapture();
+      injectSession(agent, []);
+      const read = withEngine(agent, async () => ENGINE_1M);
+      await (agent as any).sendEngineContextUpdate("test-session");
+      const session = agent.sessions["test-session"];
+      expect(session.autoCompactAt).toBe(967000);
+
+      read.mockImplementation(async () => ENGINE_200K);
+      session.modelInfos = [{ value: "haiku", displayName: "Haiku", description: "Haiku" }];
+      await (agent as any).applyConfigOptionValue("test-session", session, "model", "haiku");
+      expect(session.contextWindowConfirmed).toBe(false);
+      expect(session.autoCompactAt).toBeUndefined();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(read).toHaveBeenCalledTimes(2);
+      const all = usageOf(updates);
+      expect(all[all.length - 1]).toEqual({
+        sessionUpdate: "usage_update",
+        used: 0,
+        size: 200000,
+        _meta: { [CONTEXT_COMPACTION_META_KEY]: { atTokens: 167000 } },
+      });
+    });
   });
 });
 

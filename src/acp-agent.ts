@@ -60,6 +60,7 @@ import {
   query,
   Settings,
   SDKAssistantMessageError,
+  SDKControlGetContextUsageResponse,
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
@@ -137,6 +138,71 @@ const ZERO_USAGE = Object.freeze({
 });
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
+
+/**
+ * The `usage_update._meta` key carrying where the engine auto-compacts, in tokens
+ * (brick 4f3fa88c). The same key is emitted by codex-acp and pi-acp, so acpx reads one
+ * shape for every harness. Absent when the point is unknown or auto-compaction is off.
+ */
+export const CONTEXT_COMPACTION_META_KEY = "contextCompaction";
+
+/**
+ * What the engine's own report says about the window, read at runtime through
+ * `getContextUsage({detail:'summary'})` (brick 4f3fa88c, MEASUREMENT-ENGINE.md: the true
+ * window is known before the first turn — 1,000,000 → compaction at 967,000;
+ * 200,000 → 167,000). `compactAt` is `null` when the engine compacts nowhere we can name.
+ *
+ * ⚠️ `autoCompactThreshold` first, the `buffer` row only as a fallback: on every 200 k
+ * model measured the buffer row is ABSENT while the threshold is present.
+ */
+export function engineContextFromUsage(
+  usage: Pick<
+    SDKControlGetContextUsageResponse,
+    "maxTokens" | "autoCompactThreshold" | "isAutoCompactEnabled" | "categories"
+  >,
+): { window: number; compactAt: number | null } | undefined {
+  const window = usage.maxTokens;
+  if (typeof window !== "number" || !Number.isFinite(window) || window <= 0) {
+    return undefined;
+  }
+  if (usage.isAutoCompactEnabled !== true) {
+    return { window, compactAt: null };
+  }
+  if (typeof usage.autoCompactThreshold === "number" && usage.autoCompactThreshold > 0) {
+    return { window, compactAt: usage.autoCompactThreshold };
+  }
+  const buffer = usage.categories?.find((category) => category.kind === "buffer");
+  return { window, compactAt: buffer && buffer.tokens > 0 ? window - buffer.tokens : null };
+}
+
+/**
+ * The window this adapter REPORTS in `usage_update.size`: the engine-confirmed one, else
+ * **0 = unknown** (Daniel, 7f61daf9 DECISION.md C). Never the 200 k default or a
+ * model-name guess — a context alarm computed against a guess fires falsely (M8b: a
+ * "90 %" read on a 1 M session that was nowhere near compaction).
+ *
+ * Confirmed by the engine's report at session start, or by a `result`'s `modelUsage`.
+ */
+export function reportedContextWindow(
+  session: Pick<Session, "contextWindowSize" | "contextWindowConfirmed">,
+): number {
+  return session.contextWindowConfirmed === true ? session.contextWindowSize : 0;
+}
+
+/** `{ _meta }` when there is anything to carry, else nothing — so an update with no
+ *  metadata keeps the exact shape it had before. */
+function withMeta(meta: Record<string, unknown> | undefined): { _meta?: Record<string, unknown> } {
+  return meta && Object.keys(meta).length > 0 ? { _meta: meta } : {};
+}
+
+/** The `_meta` fragment naming the compaction point, or nothing when it is unknown. */
+function contextCompactionMeta(
+  session: Pick<Session, "autoCompactAt">,
+): Record<string, unknown> | undefined {
+  return typeof session.autoCompactAt === "number"
+    ? { [CONTEXT_COMPACTION_META_KEY]: { atTokens: session.autoCompactAt } }
+    : undefined;
+}
 
 // Coalescing bounds for the thinking-token progress signal. The SDK emits a
 // `thinking_tokens` system message per stream frame during the (often
@@ -283,6 +349,14 @@ type Session = {
    *  plain-alias heuristic (which would clobber a restored 1M back to 200k).
    *  Absent/`null` when nothing was restored. */
   restoredContextWindow?: { size: number; modelId: string } | null;
+  /** `contextWindowSize` was confirmed by the ENGINE (its `getContextUsage` report or a
+   *  `result`'s `modelUsage`), not seeded from a hint or a guess. Only a confirmed window is
+   *  reported; otherwise `size` is 0 — see {@link reportedContextWindow}. Cleared on a
+   *  model switch. */
+  contextWindowConfirmed?: boolean;
+  /** Where the engine auto-compacts, in tokens, from its own report; `null` = it does not
+   *  (auto-compaction off); absent = not read yet. Cleared on a model switch. */
+  autoCompactAt?: number | null;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
@@ -861,6 +935,7 @@ export class ClaudeAcpAgent implements Agent {
     // Needs to happen after we return the session
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
+      void this.sendEngineContextUpdate(response.sessionId);
     }, 0);
     return response;
   }
@@ -890,6 +965,7 @@ export class ClaudeAcpAgent implements Agent {
     // Needs to happen after we return the session
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
+      void this.sendEngineContextUpdate(response.sessionId);
     }, 0);
     return response;
   }
@@ -910,6 +986,7 @@ export class ClaudeAcpAgent implements Agent {
     // Needs to happen after we return the session
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
+      void this.sendEngineContextUpdate(params.sessionId);
     }, 0);
     return result;
   }
@@ -922,6 +999,7 @@ export class ClaudeAcpAgent implements Agent {
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
+      void this.sendEngineContextUpdate(params.sessionId);
     }, 0);
 
     return result;
@@ -1199,7 +1277,8 @@ export class ClaudeAcpAgent implements Agent {
                   update: {
                     sessionUpdate: "usage_update",
                     used: 0,
-                    size: session.contextWindowSize,
+                    size: reportedContextWindow(session),
+                    ...withMeta(contextCompactionMeta(session)),
                   },
                 });
                 break;
@@ -1446,7 +1525,15 @@ export class ClaudeAcpAgent implements Agent {
             // otherwise discard the window learned on a prior turn and
             // leave the next prompt's mid-stream updates reporting 200k.
             if (matchingModelUsage) {
+              const windowChanged = session.contextWindowSize !== matchingModelUsage.contextWindow;
               session.contextWindowSize = matchingModelUsage.contextWindow;
+              session.contextWindowConfirmed = true;
+              // A window the engine report did not predict (a fallback model, say) has
+              // its own compaction point — re-read it rather than keep the old one.
+              if (windowChanged) {
+                session.autoCompactAt = undefined;
+                setTimeout(() => void this.sendEngineContextUpdate(params.sessionId), 0);
+              }
             }
 
             // Task-notification followups are autonomous work triggered by a
@@ -1482,18 +1569,17 @@ export class ClaudeAcpAgent implements Agent {
                 update: {
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
-                  size: session.contextWindowSize,
+                  size: reportedContextWindow(session),
                   cost: {
                     amount: message.total_cost_usd,
                     currency: "USD",
                   },
-                  ...((message.origin || lastTurnEndReason) && {
-                    _meta: {
-                      ...(message.origin && { "_claude/origin": message.origin }),
-                      ...(lastTurnEndReason && {
-                        [LAST_TURN_END_REASON_META_KEY]: lastTurnEndReason,
-                      }),
-                    },
+                  ...withMeta({
+                    ...(message.origin && { "_claude/origin": message.origin }),
+                    ...(lastTurnEndReason && {
+                      [LAST_TURN_END_REASON_META_KEY]: lastTurnEndReason,
+                    }),
+                    ...contextCompactionMeta(session),
                   }),
                 },
               });
@@ -1628,7 +1714,8 @@ export class ClaudeAcpAgent implements Agent {
                   update: {
                     sessionUpdate: "usage_update",
                     used: nextUsage,
-                    size: session.contextWindowSize,
+                    size: reportedContextWindow(session),
+                    ...withMeta(contextCompactionMeta(session)),
                   },
                 });
               }
@@ -2447,6 +2534,43 @@ export class ClaudeAcpAgent implements Agent {
     };
   }
 
+  /**
+   * Read the window and the compaction point from the ENGINE and report them (brick
+   * 4f3fa88c): one `usage_update` carrying the engine's window as `size`, its current fill
+   * as `used`, and the compaction point in `_meta`. Every later `usage_update` carries the
+   * same window and point, so a client knows both from the first second of a session.
+   *
+   * A failed read leaves the window UNKNOWN (reported 0) until a `result` confirms it —
+   * never a guess. Never throws: this is enrichment and must not cost a session anything.
+   */
+  private async sendEngineContextUpdate(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    let usage: SDKControlGetContextUsageResponse;
+    try {
+      usage = await session.query.getContextUsage({ detail: "summary" });
+    } catch (error) {
+      this.logger.error(
+        `[claude-agent-acp] getContextUsage failed for ${sessionId}; context window stays unknown: ${String(error)}`,
+      );
+      return;
+    }
+    const engine = engineContextFromUsage(usage);
+    if (!engine || this.sessions[sessionId] !== session) return;
+    session.contextWindowSize = engine.window;
+    session.contextWindowConfirmed = true;
+    session.autoCompactAt = engine.compactAt;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "usage_update",
+        used: usage.totalTokens,
+        size: reportedContextWindow(session),
+        ...withMeta(contextCompactionMeta(session)),
+      },
+    });
+  }
+
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) return;
@@ -2510,6 +2634,11 @@ export class ClaudeAcpAgent implements Agent {
             ? session.restoredContextWindow.size
             : (inferContextWindowFromModel(value, newModelInfo?.description) ??
               DEFAULT_CONTEXT_WINDOW);
+        // The engine's window and compaction point were read for the PREVIOUS model:
+        // unknown until it is asked again, right after this switch (brick 4f3fa88c).
+        session.contextWindowConfirmed = false;
+        session.autoCompactAt = undefined;
+        setTimeout(() => void this.sendEngineContextUpdate(sessionId), 0);
       }
       session.models = { ...session.models, currentModelId: value };
 
