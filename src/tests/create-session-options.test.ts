@@ -226,6 +226,56 @@ describe("createSession options merging", () => {
     expect(capturedOptions?.env?.CUSTOM_VAR).toBe("custom-value");
   });
 
+  // USE_BUILTIN_RIPGREP=0 points the Grep tool at the system rg (and its
+  // ripgreprc) even when the owner was spawned without the container env.
+  // (brick 1e2d905a, F1)
+  describe("USE_BUILTIN_RIPGREP default", () => {
+    let original: string | undefined;
+
+    beforeEach(() => {
+      original = process.env.USE_BUILTIN_RIPGREP;
+      delete process.env.USE_BUILTIN_RIPGREP;
+    });
+
+    afterEach(() => {
+      if (original !== undefined) {
+        process.env.USE_BUILTIN_RIPGREP = original;
+      } else {
+        delete process.env.USE_BUILTIN_RIPGREP;
+      }
+    });
+
+    it("defaults USE_BUILTIN_RIPGREP to 0 when nothing sets it", async () => {
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions?.env?.USE_BUILTIN_RIPGREP).toBe("0");
+    });
+
+    it("lets process.env override the default", async () => {
+      process.env.USE_BUILTIN_RIPGREP = "1";
+
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions?.env?.USE_BUILTIN_RIPGREP).toBe("1");
+    });
+
+    it("lets a caller-provided env override the default", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              env: { USE_BUILTIN_RIPGREP: "1" },
+            },
+          },
+        },
+      });
+
+      expect(capturedOptions?.env?.USE_BUILTIN_RIPGREP).toBe("1");
+    });
+  });
+
   it("allows user-provided env vars to override process.env entries", async () => {
     await agent.newSession({
       cwd: "/test",

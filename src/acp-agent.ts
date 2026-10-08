@@ -3167,6 +3167,16 @@ export class ClaudeAcpAgent implements Agent {
       ...(!userProvidedOptions?.settings &&
         Object.keys(creationSettings).length > 0 && { settings: creationSettings }),
       env: {
+        // Default only — process.env and the caller's env still win. Without it
+        // the restored Grep tool runs Claude's embedded rg, which is hard-wired
+        // `--no-config` and so never reads the image's ripgreprc (`--binary`):
+        // NUL-bearing files drop out silently again. The image sets this var on
+        // PID 1 only, and an owner spawned from an ssh shell never inherits it.
+        // Safe where no system rg exists: in the bundled binary (SDK 0.3.287)
+        // `qJ()` takes the system branch only if `gs(USE_BUILTIN_RIPGREP)` AND
+        // `Tm("rg")` resolves on PATH; otherwise it falls through to embedded
+        // rg, i.e. today's behaviour. (brick 1e2d905a, finding F1)
+        USE_BUILTIN_RIPGREP: "0",
         ...process.env,
         ...userProvidedOptions?.env,
         ...createEnvForGateway(this.gatewayAuthRequest),
