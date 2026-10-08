@@ -111,6 +111,46 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
+  // Grep/Glob in allowedTools is what keeps `grep`/`find` in the Bash tool GNU
+  // instead of the binary's NUL-blind ugrep/bfs shell functions. (brick 1e2d905a)
+  it("opts in Grep and Glob via allowedTools by default", async () => {
+    await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+    expect(capturedOptions!.allowedTools).toEqual(["Grep", "Glob"]);
+  });
+
+  it("merges user-provided allowedTools with the Grep/Glob opt-in", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            allowedTools: ["Bash(git status)", "Glob"],
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.allowedTools).toEqual(["Bash(git status)", "Glob", "Grep"]);
+  });
+
+  it("keeps the Grep/Glob opt-in when the caller passes empty allowedTools", async () => {
+    await agent.newSession({
+      cwd: "/test",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            allowedTools: [],
+          },
+        },
+      },
+    });
+
+    expect(capturedOptions!.allowedTools).toEqual(["Grep", "Glob"]);
+  });
+
   it("sets tools to empty array when disableBuiltInTools is true", async () => {
     await agent.newSession({
       cwd: "/test",

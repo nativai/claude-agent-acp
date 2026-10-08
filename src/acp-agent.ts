@@ -408,6 +408,7 @@ export type NewSessionMeta = {
      * Those parameters will be used and updated to work with ACP:
      *   - hooks (merged with ACP's hooks)
      *   - mcpServers (merged with ACP's mcpServers)
+     *   - allowedTools (merged with ACP's Grep/Glob opt-in)
      *   - disallowedTools (merged with ACP's disallowedTools)
      *   - tools (passed through; defaults to claude_code preset if not provided)
      */
@@ -3119,6 +3120,18 @@ export class ClaudeAcpAgent implements Agent {
     // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
     const disallowedTools = ["AskUserQuestion"];
 
+    // Naming Grep or Glob in `--allowedTools` is the only switch that stops the
+    // Claude Code binary's "embedded search tools" mode, which drops the Grep/
+    // Glob tools and shadows `grep`/`find` in the Bash tool with ugrep/bfs shell
+    // functions. That ugrep runs with `-I`, so a file containing a NUL byte
+    // yields no output and exit 1 — indistinguishable from "no match". A
+    // settings.json `permissions.allow` entry does NOT count. Verified on Claude
+    // Code 2.1.292 only: after any SDK/binary bump, re-check that `type grep` in
+    // a session still prints /usr/bin/grep. (brick 1e2d905a)
+    const allowedTools = [
+      ...new Set([...(userProvidedOptions?.allowedTools || []), "Grep", "Glob"]),
+    ];
+
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
     // disableBuiltInTools is a legacy shorthand for tools: [] — kept for
@@ -3173,6 +3186,7 @@ export class ClaudeAcpAgent implements Agent {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
       },
+      allowedTools,
       disallowedTools: [...(userProvidedOptions?.disallowedTools || []), ...disallowedTools],
       tools,
       hooks: {
