@@ -3169,8 +3169,8 @@ export class ClaudeAcpAgent implements Agent {
       env: {
         // Default only — process.env and the caller's env still win. Without it
         // the restored Grep tool runs Claude's embedded rg, which is hard-wired
-        // `--no-config` and so never reads the image's ripgreprc (`--binary`):
-        // NUL-bearing files drop out silently again. The image sets this var on
+        // `--no-config` and so never reads the image's ripgreprc: NUL-bearing
+        // files drop out silently again. The image sets this var on
         // PID 1 only, and an owner spawned from an ssh shell never inherits it.
         // Safe where no system rg exists: in the bundled binary (SDK 0.3.287)
         // `qJ()` takes the system branch only if `gs(USE_BUILTIN_RIPGREP)` AND
