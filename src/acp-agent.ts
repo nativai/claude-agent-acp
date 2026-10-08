@@ -3125,9 +3125,10 @@ export class ClaudeAcpAgent implements Agent {
     // Glob tools and shadows `grep`/`find` in the Bash tool with ugrep/bfs shell
     // functions. That ugrep runs with `-I`, so a file containing a NUL byte
     // yields no output and exit 1 — indistinguishable from "no match". A
-    // settings.json `permissions.allow` entry does NOT count. Verified on Claude
-    // Code 2.1.292 only: after any SDK/binary bump, re-check that `type grep` in
-    // a session still prints /usr/bin/grep. (brick 1e2d905a)
+    // settings.json `permissions.allow` entry does NOT count. Verified only on
+    // the binary bundled with claude-agent-sdk 0.3.287 (Claude Code 2.1.287):
+    // after any SDK/binary bump, re-check that `type grep` in a session still
+    // prints /usr/bin/grep. (brick 1e2d905a)
     const allowedTools = [
       ...new Set([...(userProvidedOptions?.allowedTools || []), "Grep", "Glob"]),
     ];
