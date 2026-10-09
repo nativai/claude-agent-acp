@@ -139,6 +139,26 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 
+/** Claude CLI emits this synthetic result when an interrupted cycle ends on
+ *  queued user input before producing any assistant content. It is a hand-off
+ *  marker, not the outcome of the replacement prompt that may already be
+ *  active by the time the SDK stream delivers it. (Ported from upstream
+ *  agentclientprotocol/claude-agent-acp; brick f07e96d5.) */
+function isEmptyUserInterruptionDiagnostic(
+  message: Extract<SDKMessage, { type: "result" }>,
+): boolean {
+  const diagnostic =
+    "result" in message
+      ? message.result
+      : message.errors.find((error) => error.startsWith("[ede_diagnostic]"));
+  return (
+    diagnostic?.startsWith("[ede_diagnostic]") === true &&
+    /(?:^|\s)result_type=user(?:\s|$)/.test(diagnostic) &&
+    /(?:^|\s)last_content_type=n\/a(?:\s|$)/.test(diagnostic) &&
+    /(?:^|\s)stop_reason=null(?:\s|$)/.test(diagnostic)
+  );
+}
+
 /**
  * The `usage_update._meta` key carrying where the engine auto-compacts, in tokens
  * (brick 4f3fa88c). The same key is emitted by codex-acp and pi-acp, so acpx reads one
@@ -333,6 +353,14 @@ type Session = {
   pendingSdkMessages: (SDKMessage | null)[];
   /** Error captured by the background reader loop, to be re-thrown by the prompt. */
   backgroundLoopError: Error | null;
+  /** Set by cancel() when it ends a running prompt. cancel() returns that
+   *  prompt before the CLI emits the interrupted turn's own result — an
+   *  empty-user-interruption diagnostic the CLI delivers only after the NEXT
+   *  prompt's input is pushed — so the next prompt's loop skips exactly that
+   *  diagnostic instead of throwing it as its own failure. The next result of
+   *  any kind clears it, so a diagnostic that did not follow our cancel still
+   *  surfaces as an error. */
+  expectInterruptionDiagnostic?: boolean;
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded (in precedence
@@ -1512,6 +1540,14 @@ export class ClaudeAcpAgent implements Agent {
             }
             break;
           case "result": {
+            if (session.expectInterruptionDiagnostic) {
+              session.expectInterruptionDiagnostic = false;
+              if (!session.cancelled && isEmptyUserInterruptionDiagnostic(message)) {
+                // The tail of the turn our cancel() already ended, not this
+                // prompt's outcome: keep reading for this prompt's own turn.
+                break;
+              }
+            }
             // Accumulate usage from this result
             session.accumulatedUsage.inputTokens += message.usage.input_tokens;
             session.accumulatedUsage.outputTokens += message.usage.output_tokens;
@@ -2052,6 +2088,9 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     session.cancelled = true;
+    if (session.promptRunning) {
+      session.expectInterruptionDiagnostic = true;
+    }
     for (const [, pending] of session.pendingMessages) {
       pending.resolve(true);
     }
@@ -3698,6 +3737,8 @@ export class ClaudeAcpAgent implements Agent {
         break;
       }
       case "result": {
+        // A result delivered between turns settles any expected diagnostic.
+        session.expectInterruptionDiagnostic = false;
         // Accumulate usage from idle teammate turns.
         session.accumulatedUsage.inputTokens += message.usage.input_tokens;
         session.accumulatedUsage.outputTokens += message.usage.output_tokens;

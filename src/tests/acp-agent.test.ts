@@ -4645,6 +4645,159 @@ describe("post-error recovery", () => {
     await expect(pendingB).resolves.toBe(true);
     expect(session.pendingMessages.size).toBe(0);
   });
+
+  // Brick f07e96d5. The Claude CLI answers a cancel at turn start with an
+  // `error_during_execution` result carrying this diagnostic, but delivers it
+  // only after the NEXT prompt's input is pushed — by which time cancel() has
+  // already returned the cancelled prompt. Shape measured on CLI 0.3.287:
+  // replay of the cancelled prompt, the interrupt marker, then this result.
+  const EMPTY_INTERRUPTION_DIAGNOSTIC =
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
+
+  function createInterruptionDiagnosticResult() {
+    // A real error result carries `errors[]` and no `result` field.
+    const message: Partial<ReturnType<typeof createResultMessage>> = createResultMessage({
+      subtype: "error_during_execution",
+      stop_reason: null,
+      is_error: true,
+      errors: [EMPTY_INTERRUPTION_DIAGNOSTIC],
+    });
+    delete message.result;
+    return { ...message, usage: { ...message.usage!, input_tokens: 0, output_tokens: 0 } };
+  }
+
+  function replayOf(pushed: any) {
+    return {
+      type: "user",
+      message: pushed.message,
+      parent_tool_use_id: null,
+      uuid: pushed.uuid,
+      session_id: "test-session",
+      isReplay: true,
+    };
+  }
+
+  function injectScriptedSession(
+    agent: ClaudeAcpAgent,
+    script: (iter: AsyncIterator<any>) => AsyncGenerator<unknown>,
+  ) {
+    const input = new Pushable<any>();
+    const interrupt = vi.fn(async () => {});
+    const gen = Object.assign(script(input[Symbol.asyncIterator]()), {
+      interrupt,
+      close: vi.fn(),
+    });
+    agent.sessions["test-session"] = {
+      query: gen as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      availableOutputStyles: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      activePromptResolve: null,
+      pendingSdkMessages: [],
+      backgroundLoopError: null,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    (agent as any).startBackgroundReaderLoop("test-session");
+  }
+
+  it("a follow-up sent right after a turn-start cancel answers instead of failing on the cancelled turn's diagnostic", async () => {
+    const agent = createMockAgent();
+    injectScriptedSession(agent, async function* (iter) {
+      const first = await iter.next(); // cancelled prompt: the CLI has not replayed it yet
+      const second = await iter.next(); // the follow-up's input arrives first
+      yield replayOf(first.value);
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "[Request interrupted by user]" }],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield createInterruptionDiagnosticResult();
+      yield replayOf(second.value);
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "a" }],
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    const followUp = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "b" }],
+    });
+    expect(followUp.stopReason).toBe("end_turn");
+    expect(followUp.usage?.inputTokens).toBe(10);
+    expect(agent.sessions["test-session"].expectInterruptionDiagnostic).toBe(false);
+  });
+
+  it("still surfaces the same diagnostic as an error when no cancel preceded it", async () => {
+    const agent = createMockAgent();
+    injectScriptedSession(agent, async function* (iter) {
+      const first = await iter.next();
+      yield replayOf(first.value);
+      yield createInterruptionDiagnosticResult();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "a" }] }),
+    ).rejects.toThrow(EMPTY_INTERRUPTION_DIAGNOSTIC);
+  });
+
+  it("surfaces the diagnostic once an ordinary result has settled the cancel", async () => {
+    // The flag set by a cancel is cleared by the next result of any kind, so a
+    // later diagnostic is not swallowed on the strength of an old cancel.
+    const agent = createMockAgent();
+    injectScriptedSession(agent, async function* (iter) {
+      const first = await iter.next();
+      const second = await iter.next();
+      yield replayOf(first.value);
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield replayOf(second.value);
+      yield createInterruptionDiagnosticResult();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "a" }],
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "b" }] }),
+    ).rejects.toThrow(EMPTY_INTERRUPTION_DIAGNOSTIC);
+  });
 });
 
 describe("streamEventToAcpNotifications", () => {
