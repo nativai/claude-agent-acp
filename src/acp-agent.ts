@@ -3922,6 +3922,9 @@ function errorKindFromThrown(error: Error): SDKAssistantMessageError | undefined
       case "api_error":
       case "timeout_error":
         return "server_error";
+      default:
+        // An unrecognised type falls through to the status and message checks.
+        break;
     }
   }
 
