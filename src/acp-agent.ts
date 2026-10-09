@@ -989,6 +989,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
       void this.sendEngineContextUpdate(response.sessionId);
+      void this.announceBackgroundTasks(response.sessionId);
     }, 0);
     return response;
   }
@@ -1019,6 +1020,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
       void this.sendEngineContextUpdate(response.sessionId);
+      void this.announceBackgroundTasks(response.sessionId);
     }, 0);
     return response;
   }
@@ -1040,6 +1042,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
       void this.sendEngineContextUpdate(params.sessionId);
+      void this.announceBackgroundTasks(params.sessionId);
     }, 0);
     return result;
   }
@@ -1053,6 +1056,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
       void this.sendEngineContextUpdate(params.sessionId);
+      void this.announceBackgroundTasks(params.sessionId);
     }, 0);
 
     return result;
@@ -3918,6 +3922,26 @@ export class ClaudeAcpAgent implements Agent {
     }
   }
 
+  /**
+   * Once per session/new, load, resume and fork, after the response: send the current set — empty
+   * included, and even when it equals the last payload. A client learns that THIS adapter process
+   * forwards the set only from a payload it has seen since the process started (acpx-ui decides it
+   * per adapter process, at `initialize`); an announcement only on change left a respawned owner
+   * (idle release, recover, pod restart) reading as non-forwarding until its next background change
+   * — today's phantom "Running tool" at every turn start (test-engineer D4, brick cec4c064).
+   */
+  private async announceBackgroundTasks(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const tracker: BackgroundTaskTracker = (session.backgroundTasks ??= {
+      live: [],
+      startedAt: new Map(),
+      toolNames: new Map(),
+    });
+    tracker.lastSentKey = undefined;
+    await this.sendBackgroundTasks(sessionId, tracker, new Date().toISOString());
+  }
+
   private async sendBackgroundTasks(
     sessionId: string,
     tracker: BackgroundTaskTracker,
@@ -3935,12 +3959,15 @@ export class ClaudeAcpAgent implements Agent {
     });
     const key = JSON.stringify(tasks);
     if (key === tracker.lastSentKey) return;
-    tracker.lastSentKey = key;
-    await this.client
-      .extNotification(BACKGROUND_TASKS_NOTIFICATION, { sessionId, at, tasks })
-      .catch((err) =>
-        this.logger.error(`Session ${sessionId}: failed to send background tasks:`, err),
-      );
+    try {
+      await this.client.extNotification(BACKGROUND_TASKS_NOTIFICATION, { sessionId, at, tasks });
+      // Recorded only once delivered: a failed send (above all of the EMPTY set, which would leave
+      // the client believing work is live until its 15-min ceiling) is re-sent at the next event
+      // instead of being deduplicated away (test-engineer D5, brick cec4c064).
+      tracker.lastSentKey = key;
+    } catch (err) {
+      this.logger.error(`Session ${sessionId}: failed to send background tasks:`, err);
+    }
   }
 
   /**

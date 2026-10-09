@@ -206,3 +206,66 @@ describe("_claude/backgroundTasks (brick cec4c064)", () => {
     expect(bgPayloads(t.wire).map((x) => x.tasks.length)).toEqual([1, 0]);
   });
 });
+
+describe("_claude/backgroundTasks per adapter process (D4, D5)", () => {
+  // D4: a client decides "this adapter process forwards the set" only from a payload it has seen
+  // since the process started. Each session entry point announces the current set once, after the
+  // response, empty included — so a respawned owner is forwarding from its first turn.
+  for (const entry of ["newSession", "resumeSession", "loadSession"] as const) {
+    it(`D4: ${entry} announces the current set once after the response (empty included)`, async () => {
+      const t = setup();
+      const agent = t.agent as any;
+      agent.createSession = async () => ({ sessionId: "s", models: {}, modes: {}, configOptions: [] });
+      agent.getOrCreateSession = async () => ({ models: {}, modes: {}, configOptions: [] });
+      agent.replaySessionHistory = async () => {};
+      agent.sendAvailableCommandsUpdate = () => {};
+      agent.sendEngineContextUpdate = async () => {};
+      await agent[entry]({ sessionId: "s", cwd: "/test", mcpServers: [] });
+      expect(bgPayloads(t.wire)).toHaveLength(0); // deferred: after the response
+      await flush();
+      const sent = bgPayloads(t.wire);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toEqual({ sessionId: "s", at: expect.stringMatching(ISO), tasks: [] });
+    });
+  }
+
+  it("D4: the announcement re-sends a live set even when it equals the last payload", async () => {
+    const t = setup();
+    await feed(t, [changed([task("a1")])]);
+    const agent = t.agent as any;
+    agent.getOrCreateSession = async () => ({ models: {}, modes: {}, configOptions: [] });
+    agent.sendAvailableCommandsUpdate = () => {};
+    agent.sendEngineContextUpdate = async () => {};
+    await agent.resumeSession({ sessionId: "s", cwd: "/test", mcpServers: [] });
+    await flush();
+    const sent = bgPayloads(t.wire);
+    expect(sent.map((p) => p.tasks.map((x: any) => x.taskId))).toEqual([["a1"], ["a1"]]);
+    expect(sent[1].tasks[0].startedAt).toBe(sent[0].tasks[0].startedAt);
+  });
+
+  // D5: a failed send must not be deduplicated away — above all the EMPTY set, whose loss would
+  // leave the client believing work is live until its 15-min ceiling.
+  it("D5: a failed send is re-sent at the next event, not deduplicated", async () => {
+    const t = setup();
+    const client = (t.agent as any).client;
+    const original = client.extNotification.bind(client);
+    let failNext = false;
+    let attempts = 0;
+    client.extNotification = async (method: string, params: any) => {
+      if (method === BACKGROUND_TASKS_NOTIFICATION) {
+        attempts++;
+        if (failNext) {
+          failNext = false;
+          throw new Error("transport hiccup");
+        }
+      }
+      return original(method, params);
+    };
+    await feed(t, [changed([task("a1")])]);
+    failNext = true;
+    await feed(t, [changed([])]); // lost
+    await feed(t, [changed([])]); // the next event: must re-send
+    expect(attempts).toBe(3);
+    expect(bgPayloads(t.wire).map((p) => p.tasks.length)).toEqual([1, 0]);
+  });
+});
