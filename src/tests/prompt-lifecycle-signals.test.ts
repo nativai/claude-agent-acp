@@ -83,7 +83,12 @@ function setup() {
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
     settingsManager: { dispose: vi.fn() },
-    accumulatedUsage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
+    accumulatedUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    },
     configOptions: [],
     availableOutputStyles: [],
     promptRunning: false,
@@ -229,8 +234,14 @@ const markersOnUpdates = (wire: Wire[]) =>
   );
 const settlementIndex = (wire: Wire[], promptId?: string) =>
   wire.findIndex((w) => (w.k === "response" || w.k === "reject") && w.promptId === promptId);
-const indexOfUpdate = (wire: Wire[], pred: (n: any) => boolean) =>
-  wire.findIndex((w) => w.k === "update" && pred(w.n));
+const phasesFor = (wire: Wire[], promptId: string) =>
+  lifecycle(wire)
+    .filter((s) => s.params.promptId === promptId)
+    .map((s) => s.params.phase);
+
+// Every "no signal here" row first asserts that the same harness DID carry the
+// owning prompt's signals. Without that control an absence proves nothing — it
+// holds just as well on an adapter that never signals at all.
 
 // ---- §6 adapter rows -------------------------------------------------------
 
@@ -344,19 +355,26 @@ describe("prompt lifecycle signals (brick a147982f, §6 adapter rows)", () => {
     expect(markersOnUpdates(t.wire)).toHaveLength(0);
   });
 
-  it("P4: an empty or non-string promptId counts as no id", async () => {
-    for (const bad of ["", 42]) {
+  it("P4: an empty or non-string promptId counts as no id (control: a valid one signals)", async () => {
+    const valid = randomUUID();
+    for (const [id, signals] of [
+      ["", false],
+      [42, false],
+      [valid, true],
+    ] as const) {
       const t = setup();
       const p = t.agent.prompt({
         sessionId: "s",
         prompt: [{ type: "text", text: "hi" }],
-        _meta: { [PROMPT_ID_META_KEY]: bad },
+        _meta: { [PROMPT_ID_META_KEY]: id },
       });
       await flush();
       await feed(t, [replayOf(t.pushed[0]), assistant(), result(), idle()]);
       const r: any = await p;
-      expect(t.wire.filter((w) => w.k === "ext")).toHaveLength(0);
-      expect(r._meta[PROMPT_ID_META_KEY]).toBeUndefined();
+      expect(lifecycle(t.wire).map((s) => s.params.phase)).toEqual(
+        signals ? ["sdk_idle", "completing"] : [],
+      );
+      expect(r._meta[PROMPT_ID_META_KEY]).toBe(signals ? valid : undefined);
     }
   });
 
@@ -421,6 +439,7 @@ describe("prompt lifecycle signals (brick a147982f, §6 adapter rows)", () => {
     await flush();
     await feed(t, [replayOf(t.pushed[0]), assistant(), result(), idle()]);
     await p;
+    expect(phasesFor(t.wire, id)).toEqual(["sdk_idle", "completing"]); // control
     const before = t.wire.length;
 
     // Teammate / sub-agent activity after the turn ended.
@@ -443,6 +462,7 @@ describe("prompt lifecycle signals (brick a147982f, §6 adapter rows)", () => {
     await flush();
     await feed(t, [replayOf(t.pushed[0]), assistant(), result(), idle()]);
     await p;
+    expect(phasesFor(t.wire, id)).toEqual(["sdk_idle", "completing"]); // control
     const before = t.wire.length;
 
     await feed(t, [
@@ -484,14 +504,21 @@ describe("prompt lifecycle signals (brick a147982f, §6 adapter rows)", () => {
 
   it("N5: the cancel return sends no completing", async () => {
     const t = setup();
-    const id = randomUUID();
-    const p = t.prompt("x", id);
+    const done = randomUUID();
+    const p1 = t.prompt("x", done);
     await flush();
-    await feed(t, [replayOf(t.pushed[0]), assistant()]);
+    await feed(t, [replayOf(t.pushed[0]), assistant(), result(), idle()]);
+    await p1;
+    expect(phasesFor(t.wire, done)).toEqual(["sdk_idle", "completing"]); // control
+
+    const cancelled = randomUUID();
+    const p2 = t.prompt("y", cancelled);
+    await flush();
+    await feed(t, [replayOf(t.pushed[1]), assistant()]);
     await t.agent.cancel({ sessionId: "s" });
-    const r: any = await p;
+    const r: any = await p2;
     expect(r.stopReason).toBe("cancelled");
-    expect(lifecycle(t.wire)).toHaveLength(0);
+    expect(phasesFor(t.wire, cancelled)).toEqual([]);
   });
 
   it("A3: a cancel that the SDK acknowledges with idle reports completing{cancelled}, even after a pre-cancel end_turn result", async () => {
@@ -660,13 +687,19 @@ describe("edge: a prompt arriving during an idle-time continuation", () => {
   // continuation's idle, before the SDK has even replayed P2: P2's real turn
   // then streams as unowned inter-turn output. This row asserts the CORRECT
   // behaviour and is expected to fail; whoever fixes the loop flips it to `it`.
-  it.fails("pre-existing: P2's response must not resolve on an idle that precedes P2's replay", async () => {
-    const t = setup();
-    await promptOneThenStartContinuation(t, randomUUID());
-    const p2 = t.prompt("second", randomUUID());
-    await flush();
-    await feed(t, [assistant(), result({ origin: TASK_NOTIFICATION_ORIGIN }), idle()]);
-    const settledBeforeReplay = await Promise.race([p2.then(() => true), flush().then(() => false)]);
-    expect(settledBeforeReplay).toBe(false);
-  });
+  it.fails(
+    "pre-existing: P2's response must not resolve on an idle that precedes P2's replay",
+    async () => {
+      const t = setup();
+      await promptOneThenStartContinuation(t, randomUUID());
+      const p2 = t.prompt("second", randomUUID());
+      await flush();
+      await feed(t, [assistant(), result({ origin: TASK_NOTIFICATION_ORIGIN }), idle()]);
+      const settledBeforeReplay = await Promise.race([
+        p2.then(() => true),
+        flush().then(() => false),
+      ]);
+      expect(settledBeforeReplay).toBe(false);
+    },
+  );
 });
