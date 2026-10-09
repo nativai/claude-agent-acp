@@ -273,9 +273,25 @@ export const SESSION_STATUS_NOTIFICATION = "_claude/sessionStatus";
  *  message identity can evict the superseded messages; non-handling clients
  *  ignore it (no transcript impact). */
 export const MODEL_REFUSAL_FALLBACK_NOTIFICATION = "_claude/modelRefusalFallback";
-/** `_meta` key carrying the terminal turn reason on the final `usage_update`
- *  `session/update` and on the `PromptResponse`. */
+/** `_meta` key carrying the terminal turn reason on the `PromptResponse`, and on
+ *  the `usage_update` of a `result` that completes the prompt by error. Never on
+ *  a mid-prompt `usage_update`: a `result` ends one model loop, not the ACP
+ *  prompt, and acpx's turn watchdog treated the marker as "the turn is over"
+ *  (brick a147982f, CONCEPTION §4.2 A1). */
 export const LAST_TURN_END_REASON_META_KEY = "_claude/lastTurnEndReason";
+/** `PromptRequest._meta` key: an opaque per-attempt id minted by the client
+ *  (acpx). Echoed on {@link PROMPT_LIFECYCLE_NOTIFICATION} and on the
+ *  `PromptResponse._meta`, so the client can attribute both to the attempt it
+ *  guards (brick a147982f, CONCEPTION §4.1). */
+export const PROMPT_ID_META_KEY = "_claude/promptId";
+/** ext-notification (NOT a `session/update`, so frame counters stay correct)
+ *  carrying `{ sessionId, promptId, phase }`, sent only for prompts that carried
+ *  a {@link PROMPT_ID_META_KEY}:
+ *  - `phase: "sdk_idle"` — from the background reader the moment it sees SDK
+ *    idle while that prompt owns the stream; reason-less.
+ *  - `phase: "completing"`, `lastTurnEndReason` — from the prompt loop just
+ *    before it returns the response from SDK idle, or rejects the prompt. */
+export const PROMPT_LIFECYCLE_NOTIFICATION = "_claude/promptLifecycle";
 
 /** ACP `session/set_config_option` id for the Claude Code output style.
  *  Deliberately IDENTICAL to the SDK `Settings` key `outputStyle`, so no
@@ -317,6 +333,10 @@ type Session = {
    *  all (honest "unsupported" rather than an empty dropdown). */
   availableOutputStyles: string[];
   promptRunning: boolean;
+  /** The client's `_claude/promptId` of the prompt whose loop is consuming the
+   *  stream; unset when that prompt carried none, or when no loop consumes it
+   *  (idle-time turns). Gates the reader's `sdk_idle` lifecycle signal. */
+  activePromptId?: string;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
   abortController: AbortController;
@@ -1065,6 +1085,29 @@ export class ClaudeAcpAgent implements Agent {
 
     const userMessage = promptToClaude(params);
 
+    const requestedPromptId = params._meta?.[PROMPT_ID_META_KEY];
+    const promptId =
+      typeof requestedPromptId === "string" && requestedPromptId.length > 0
+        ? requestedPromptId
+        : undefined;
+    /** Best-effort: the write must never change the prompt's outcome. */
+    const sendCompleting = async (reason: LastTurnEndReason): Promise<void> => {
+      if (!promptId) return;
+      try {
+        await this.client.extNotification(PROMPT_LIFECYCLE_NOTIFICATION, {
+          sessionId: params.sessionId,
+          promptId,
+          phase: "completing",
+          lastTurnEndReason: reason,
+        });
+      } catch (err) {
+        this.logger.error(
+          `Session ${params.sessionId}: failed to send prompt lifecycle "completing":`,
+          err,
+        );
+      }
+    };
+
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
@@ -1106,6 +1149,7 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.promptRunning = true;
+    session.activePromptId = promptId;
     let handedOff = false;
     let errored = false;
     let stopReason: StopReason = "end_turn";
@@ -1302,20 +1346,25 @@ export class ClaudeAcpAgent implements Agent {
                   // Forward the terminal reason as a structured PromptResponse
                   // field too (CONCEPTION §3 "and/or a structured prompt-result
                   // field"). Falls back to mapping the final stopReason if no
-                  // result message captured it.
+                  // result message captured it. A cancelled turn reports
+                  // `cancelled` even when a pre-cancel result captured `end_turn`.
                   const endReason: LastTurnEndReason =
-                    lastTurnEndReason ??
-                    (stopReason === "max_tokens"
-                      ? "max_tokens"
-                      : stopReason === "max_turn_requests"
-                        ? "max_turns"
-                        : stopReason === "cancelled"
-                          ? "cancelled"
-                          : "end_turn");
+                    stopReason === "cancelled"
+                      ? "cancelled"
+                      : (lastTurnEndReason ??
+                        (stopReason === "max_tokens"
+                          ? "max_tokens"
+                          : stopReason === "max_turn_requests"
+                            ? "max_turns"
+                            : "end_turn"));
+                  await sendCompleting(endReason);
                   return {
                     stopReason,
                     usage: sessionUsage(session),
-                    _meta: { [LAST_TURN_END_REASON_META_KEY]: endReason },
+                    _meta: {
+                      [LAST_TURN_END_REASON_META_KEY]: endReason,
+                      ...(promptId && { [PROMPT_ID_META_KEY]: promptId }),
+                    },
                   };
                 }
                 break;
@@ -1544,8 +1593,9 @@ export class ClaudeAcpAgent implements Agent {
             const isTaskNotification = message.origin?.kind === "task-notification";
 
             // Capture the terminal turn reason (CONCEPTION §3, D3) so it can be
-            // forwarded to the client on the final usage_update and the
-            // PromptResponse. Mirrors the stop reasons the switch below derives.
+            // forwarded to the client on the PromptResponse (and on the
+            // usage_update of an error-completing result). Mirrors the stop
+            // reasons the switch below derives.
             // Task-notification followups are autonomous and never set it.
             if (!isTaskNotification) {
               if (message.subtype === "success" || message.subtype === "error_during_execution") {
@@ -1561,9 +1611,19 @@ export class ClaudeAcpAgent implements Agent {
               }
             }
 
-            // Send usage_update notification. Carry the terminal turn reason in
-            // `_meta` so the acpx-ui server reads it off the same `usage_update`
-            // stream-tail it already treats as the turn-end marker (§2.2).
+            // A cancelled turn never throws from its result (see the break below).
+            const completionError = session.cancelled
+              ? null
+              : resultCompletionError(message, lastAssistantError);
+
+            // Send usage_update notification. The terminal turn reason rides in
+            // `_meta` ONLY when this result completes the prompt by error (the
+            // acpx-ui `used:0 + 'error'` sentinel). ⚠️ Do not put it back on
+            // every result: a `result` ends one model loop, not the prompt —
+            // background tasks re-drive the model inside the same prompt, and
+            // acpx's turn watchdog cut those live turns 120 s after the marker
+            // (brick a147982f, A1). The prompt's end is signalled by
+            // PROMPT_LIFECYCLE_NOTIFICATION and the PromptResponse instead.
             if (lastAssistantTotalUsage !== null) {
               await this.client.sessionUpdate({
                 sessionId: params.sessionId,
@@ -1577,9 +1637,10 @@ export class ClaudeAcpAgent implements Agent {
                   },
                   ...withMeta({
                     ...(message.origin && { "_claude/origin": message.origin }),
-                    ...(lastTurnEndReason && {
-                      [LAST_TURN_END_REASON_META_KEY]: lastTurnEndReason,
-                    }),
+                    ...(completionError &&
+                      lastTurnEndReason && {
+                        [LAST_TURN_END_REASON_META_KEY]: lastTurnEndReason,
+                      }),
                     ...contextCompactionMeta(session),
                   }),
                 },
@@ -1593,22 +1654,17 @@ export class ClaudeAcpAgent implements Agent {
               break;
             }
 
+            if (completionError) {
+              throw completionError;
+            }
+
             switch (message.subtype) {
               case "success": {
-                if (message.result.includes("Please run /login")) {
-                  throw RequestError.authRequired();
-                }
                 if (message.stop_reason === "max_tokens") {
                   if (!isTaskNotification) {
                     stopReason = "max_tokens";
                   }
                   break;
-                }
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.result,
-                  );
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
@@ -1638,12 +1694,6 @@ export class ClaudeAcpAgent implements Agent {
                   }
                   break;
                 }
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
-                  );
-                }
                 if (!isTaskNotification) {
                   stopReason = "end_turn";
                 }
@@ -1652,12 +1702,6 @@ export class ClaudeAcpAgent implements Agent {
               case "error_max_budget_usd":
               case "error_max_turns":
               case "error_max_structured_output_retries":
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
-                  );
-                }
                 if (!isTaskNotification) {
                   stopReason = "max_turn_requests";
                 }
@@ -1928,6 +1972,9 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session did not end in result");
     } catch (error) {
       errored = true;
+      // Every path below rejects the prompt. Signal it first, so a drain that
+      // hangs still leaves the client an attributed signal to recover from.
+      await sendCompleting("error");
       // A failed turn typically leaves a trailing `session_state_changed: idle`
       // (and possibly more) in the query iterator. If we don't drain it here,
       // the next prompt's first `query.next()` consumes that stale idle and
@@ -1976,6 +2023,11 @@ export class ClaudeAcpAgent implements Agent {
       // Always clear the resolve callback so the background loop switches to
       // idle mode (forwarding inter-turn activity) when this prompt exits.
       session.activePromptResolve = null;
+      // This loop accepts no further message, so no later idle is this prompt's
+      // own. Cleared here rather than beside each `promptRunning = false`: a
+      // drain below keeps `promptRunning` set while it routes buffered messages
+      // to idle handling, and a successor sets its own id when it takes over.
+      session.activePromptId = undefined;
 
       if (!handedOff) {
         if (errored) {
@@ -3556,6 +3608,37 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
 
+          // `sdk_idle` lifecycle signal (brick a147982f, A4): sent BEFORE the
+          // routing below, so a routing hole that strands the prompt loop still
+          // leaves the client an attributed signal to arm its watchdog on.
+          // Fire-and-forget: the write is enqueued synchronously, so it reaches
+          // the client ahead of the loop's `completing` and the response, and
+          // the routing below stays untouched. The condition mirrors the loop's
+          // own: the routing below hands every message to the owning loop while
+          // `promptRunning`, and that loop takes the first idle it is given as
+          // its turn's end. `activePromptId` is unset during idle-time turns
+          // (S3), for prompts that carried no id, and once the loop has exited.
+          if (
+            value.type === "system" &&
+            value.subtype === "session_state_changed" &&
+            value.state === "idle" &&
+            session.promptRunning &&
+            session.activePromptId
+          ) {
+            void this.client
+              .extNotification(PROMPT_LIFECYCLE_NOTIFICATION, {
+                sessionId,
+                promptId: session.activePromptId,
+                phase: "sdk_idle",
+              })
+              .catch((err) =>
+                this.logger.error(
+                  `Session ${sessionId}: failed to send prompt lifecycle "sdk_idle":`,
+                  err,
+                ),
+              );
+          }
+
           if (session.activePromptResolve) {
             // Deliver to the active prompt's nextMessage() call.
             const resolve = session.activePromptResolve;
@@ -3889,6 +3972,42 @@ function errorKindData(
   errorKind: SDKAssistantMessageError | undefined,
 ): { errorKind: SDKAssistantMessageError } | undefined {
   return errorKind ? { errorKind } : undefined;
+}
+
+/**
+ * The error a `result` completes the prompt with, or `null` when the prompt
+ * carries on. The prompt loop throws exactly this — and puts the turn-end
+ * marker on the result's `usage_update` only when it is non-null — so the
+ * marker can never disagree with whether the prompt actually ended there.
+ */
+function resultCompletionError(
+  message: Extract<SDKMessage, { type: "result" }>,
+  lastAssistantError: SDKAssistantMessageError | undefined,
+): RequestError | null {
+  switch (message.subtype) {
+    case "success":
+      if (message.result.includes("Please run /login")) {
+        return RequestError.authRequired();
+      }
+      if (message.stop_reason === "max_tokens" || !message.is_error) return null;
+      return RequestError.internalError(errorKindData(lastAssistantError), message.result);
+    case "error_during_execution":
+      if (message.stop_reason === "max_tokens" || !message.is_error) return null;
+      return RequestError.internalError(
+        errorKindData(lastAssistantError),
+        message.errors.join(", ") || message.subtype,
+      );
+    case "error_max_budget_usd":
+    case "error_max_turns":
+    case "error_max_structured_output_retries":
+      if (!message.is_error) return null;
+      return RequestError.internalError(
+        errorKindData(lastAssistantError),
+        message.errors.join(", ") || message.subtype,
+      );
+    default:
+      return null;
+  }
 }
 
 /**

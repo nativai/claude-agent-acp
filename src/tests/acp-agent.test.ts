@@ -4214,14 +4214,14 @@ describe("result origin handling", () => {
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
-    // _meta now also carries the terminal turn reason (CONCEPTION §3) alongside origin.
+    // A non-error result does not complete the prompt, so no turn-end marker
+    // rides beside the origin (brick a147982f A1).
     expect(usageUpdate.update._meta).toEqual({
       "_claude/origin": { kind: "channel", server: "acp" },
-      "_claude/lastTurnEndReason": "end_turn",
     });
   });
 
-  it("carries lastTurnEndReason in usage_update _meta when origin is absent", async () => {
+  it("carries no lastTurnEndReason in usage_update _meta for a non-error result (A1)", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createAssistantMessage(),
@@ -4229,14 +4229,16 @@ describe("result origin handling", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
-    // With no origin, _meta carries only the terminal turn reason.
-    expect(usageUpdate.update._meta).toEqual({
-      "_claude/lastTurnEndReason": "end_turn",
-    });
+    expect(usageUpdate.update._meta?.["_claude/lastTurnEndReason"]).toBeUndefined();
+    // The reason still reaches the client, on the PromptResponse.
+    expect((response as any)._meta["_claude/lastTurnEndReason"]).toBe("end_turn");
   });
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
@@ -4838,7 +4840,10 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
 
   // ---- (c) lastTurnEndReason forwarding -----------------------------------
 
-  it("(c) forwards max_tokens as lastTurnEndReason on usage_update _meta and PromptResponse _meta", async () => {
+  // The non-error reasons below reach the client on the PromptResponse only: a
+  // result's usage_update carries the marker solely when that result completes
+  // the prompt by error (brick a147982f A1).
+  it("(c) forwards max_tokens as lastTurnEndReason on PromptResponse _meta, not on the usage_update", async () => {
     const { agent, updates } = createCaptureAgent();
     injectMessageSession(agent, [
       createAssistant(),
@@ -4852,7 +4857,7 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
     });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_tokens");
+    expect(usageUpdate.update._meta?.[LAST_TURN_END_REASON_META_KEY]).toBeUndefined();
     expect(response.stopReason).toBe("max_tokens");
     expect((response as any)._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_tokens");
   });
@@ -4871,7 +4876,7 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
     });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("end_turn");
+    expect(usageUpdate.update._meta?.[LAST_TURN_END_REASON_META_KEY]).toBeUndefined();
     expect((response as any)._meta[LAST_TURN_END_REASON_META_KEY]).toBe("end_turn");
   });
 
@@ -4889,7 +4894,7 @@ describe("reliability surfacing: timeouts + max_tokens + cancel hygiene", () => 
     });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate.update._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_turns");
+    expect(usageUpdate.update._meta?.[LAST_TURN_END_REASON_META_KEY]).toBeUndefined();
     expect(response.stopReason).toBe("max_turn_requests");
     expect((response as any)._meta[LAST_TURN_END_REASON_META_KEY]).toBe("max_turns");
   });
