@@ -4650,7 +4650,8 @@ describe("post-error recovery", () => {
   // `error_during_execution` result carrying this diagnostic, but delivers it
   // only after the NEXT prompt's input is pushed — by which time cancel() has
   // already returned the cancelled prompt. Shape measured on CLI 0.3.287:
-  // replay of the cancelled prompt, the interrupt marker, then this result.
+  // replay of the cancelled prompt, the interrupt marker, this result, a
+  // `command_lifecycle` cancelled frame and an idle — then the next turn.
   const EMPTY_INTERRUPTION_DIAGNOSTIC =
     "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
 
@@ -4736,6 +4737,10 @@ describe("post-error recovery", () => {
         session_id: "test-session",
       };
       yield createInterruptionDiagnosticResult();
+      // The cancelled turn closes with its own idle before the follow-up starts.
+      yield { type: "command_lifecycle", uuid: randomUUID(), state: "cancelled" };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
       yield replayOf(second.value);
       yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
       yield { type: "system", subtype: "session_state_changed", state: "idle" };

@@ -357,7 +357,8 @@ type Session = {
    *  prompt before the CLI emits the interrupted turn's own result — an
    *  empty-user-interruption diagnostic the CLI delivers only after the NEXT
    *  prompt's input is pushed — so the next prompt's loop skips exactly that
-   *  diagnostic instead of throwing it as its own failure. The next result of
+   *  diagnostic (and the idle that closes the interrupted turn) instead of
+   *  throwing it as its own failure. The next result of
    *  any kind clears it, so a diagnostic that did not follow our cancel still
    *  surfaces as an error. */
   expectInterruptionDiagnostic?: boolean;
@@ -1090,6 +1091,11 @@ export class ClaudeAcpAgent implements Agent {
     // `compacting` status sets it again, so every distinct compaction (e.g.
     // repeated auto-compactions in a long turn) is still shown.
     let compactionInProgress = false;
+    // Brick f07e96d5: set when this prompt skips the interrupted turn's
+    // diagnostic (see `expectInterruptionDiagnostic`); consumes that turn's
+    // closing idle, which arrives before this prompt's own input is replayed.
+    let skipInterruptedTurnIdle = false;
+    let ownPromptReplayed = false;
 
     const userMessage = promptToClaude(params);
 
@@ -1324,6 +1330,12 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
+                  if (skipInterruptedTurnIdle && !ownPromptReplayed && !session.cancelled) {
+                    // Only before this prompt's own replay: an idle there
+                    // cannot end this prompt's turn, which has not started.
+                    skipInterruptedTurnIdle = false;
+                    break;
+                  }
                   if (session.cancelled) {
                     stopReason = "cancelled";
                   }
@@ -1545,6 +1557,9 @@ export class ClaudeAcpAgent implements Agent {
               if (!session.cancelled && isEmptyUserInterruptionDiagnostic(message)) {
                 // The tail of the turn our cancel() already ended, not this
                 // prompt's outcome: keep reading for this prompt's own turn.
+                // The CLI closes that tail with an idle of its own before it
+                // starts this prompt's input, so that idle is skipped too.
+                skipInterruptedTurnIdle = true;
                 break;
               }
             }
@@ -1783,6 +1798,7 @@ export class ClaudeAcpAgent implements Agent {
             // Check for prompt replay
             if (message.type === "user" && "uuid" in message && message.uuid) {
               if (message.uuid === promptUuid) {
+                ownPromptReplayed = true;
                 break;
               }
 
