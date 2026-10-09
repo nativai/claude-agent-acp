@@ -303,9 +303,9 @@ describe("prompt lifecycle signals (brick a147982f, §6 adapter rows)", () => {
     const all = lifecycle(t.wire);
     expect(all.map((s) => s.params.phase)).toEqual(["sdk_idle", "completing"]);
     expect(all.every((s) => s.params.promptId === id)).toBe(true);
-    const lastUsage = usageUpdates(t.wire).at(-1)!;
-    expect(usageUpdates(t.wire)).toHaveLength(2);
-    expect(all[0].i).toBeGreaterThan(lastUsage.i);
+    const usageRows = usageUpdates(t.wire);
+    expect(usageRows).toHaveLength(2);
+    expect(all[0].i).toBeGreaterThan(usageRows[1].i);
     expect(markersOnUpdates(t.wire)).toHaveLength(0);
   });
 
