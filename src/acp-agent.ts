@@ -3971,6 +3971,39 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   /**
+   * `_meta.claudeCode` fields common to task_progress / task_<status> updates: the originating tool's
+   * name and, for sub-agent tools only, the sub-agent identity.
+   *
+   * A background Bash or Monitor also raises task events, keyed by the same tool_use_id as its card.
+   * Labelling those "Agent" with `subagentId = taskId` makes every consumer treat a shell command as a
+   * sub-agent and rename its card, so the tool is resolved from `toolUseCache` and the sub-agent fields
+   * are set only when it is Agent/Task. When the origin cannot be resolved (no tool_use_id — teammate
+   * tasks — or an id absent from the cache) the legacy Agent shape is kept: that is the only caller that
+   * cannot be told apart from a teammate, and acpx routes teammate output by `subagentId`.
+   */
+  private taskLifecycleMeta(
+    toolUseId: string | undefined,
+    taskId: string,
+  ): {
+    toolName: string;
+    subagentId?: string;
+    subagentName?: string;
+    subagentColor?: string;
+  } {
+    const originTool = toolUseId ? this.toolUseCache[toolUseId]?.name : undefined;
+    if (originTool !== undefined && originTool !== "Agent" && originTool !== "Task") {
+      return { toolName: originTool };
+    }
+    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
+    return {
+      toolName: originTool ?? "Agent",
+      subagentId: subagent?.agentId ?? taskId,
+      subagentName: subagent?.name,
+      subagentColor: subagent?.color,
+    };
+  }
+
+  /**
    * Called when a task_progress system message arrives.
    * Emits a tool_call_update with status 'task_progress' so ACPX can observe subagent activity.
    */
@@ -3980,17 +4013,13 @@ export class ClaudeAcpAgent implements Agent {
     lastToolName: string | undefined,
     sessionId: string,
   ): Promise<void> {
-    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         _meta: {
           claudeCode: {
-            toolName: "Agent",
+            ...this.taskLifecycleMeta(toolUseId, taskId),
             status: "task_progress",
-            subagentId: subagent?.agentId ?? taskId,
-            subagentName: subagent?.name,
-            subagentColor: subagent?.color,
             taskLastToolName: lastToolName,
           },
         } satisfies ToolUpdateMeta,
@@ -4010,17 +4039,13 @@ export class ClaudeAcpAgent implements Agent {
     status: "completed" | "failed" | "stopped",
     sessionId: string,
   ): Promise<void> {
-    const subagent = toolUseId ? this.subagentCache.get(toolUseId) : undefined;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         _meta: {
           claudeCode: {
-            toolName: "Agent",
+            ...this.taskLifecycleMeta(toolUseId, taskId),
             status: `task_${status}`,
-            subagentId: subagent?.agentId ?? taskId,
-            subagentName: subagent?.name,
-            subagentColor: subagent?.color,
           },
         } satisfies ToolUpdateMeta,
         toolCallId: toolUseId ?? taskId,
