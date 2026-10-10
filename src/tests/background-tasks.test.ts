@@ -63,7 +63,12 @@ function setup() {
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
     settingsManager: { dispose: vi.fn() },
-    accumulatedUsage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
+    accumulatedUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    },
     configOptions: [],
     availableOutputStyles: [],
     promptRunning: false,
@@ -97,7 +102,8 @@ const sys = (subtype: string, extra: Record<string, unknown> = {}) => ({
   uuid: randomUUID(),
   ...extra,
 });
-const changed = (tasks: Array<Record<string, unknown>>) => sys("background_tasks_changed", { tasks });
+const changed = (tasks: Array<Record<string, unknown>>) =>
+  sys("background_tasks_changed", { tasks });
 const task = (id: string, type = "local_agent", description = "helper " + id, extra = {}) => ({
   task_id: id,
   task_type: type,
@@ -106,7 +112,9 @@ const task = (id: string, type = "local_agent", description = "helper " + id, ex
 });
 
 const bgPayloads = (wire: Wire[]) =>
-  wire.flatMap((w) => (w.k === "ext" && w.method === BACKGROUND_TASKS_NOTIFICATION ? [w.params] : []));
+  wire.flatMap((w) =>
+    w.k === "ext" && w.method === BACKGROUND_TASKS_NOTIFICATION ? [w.params] : [],
+  );
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -114,14 +122,22 @@ describe("_claude/backgroundTasks (brick cec4c064)", () => {
   it("forwards the live set idle, drops ambient tasks, stamps at + startedAt", async () => {
     const t = setup();
     await feed(t, [
-      changed([task("a1", "local_agent", "background helper"), task("w1", "monitor_ws", "watcher", { ambient: true })]),
+      changed([
+        task("a1", "local_agent", "background helper"),
+        task("w1", "monitor_ws", "watcher", { ambient: true }),
+      ]),
     ]);
     const sent = bgPayloads(t.wire);
     expect(sent).toHaveLength(1);
     expect(sent[0].sessionId).toBe("s");
     expect(sent[0].at).toMatch(ISO);
     expect(sent[0].tasks).toEqual([
-      { taskId: "a1", taskType: "local_agent", description: "background helper", startedAt: sent[0].at },
+      {
+        taskId: "a1",
+        taskType: "local_agent",
+        description: "background helper",
+        startedAt: sent[0].at,
+      },
     ]);
   });
 
@@ -133,7 +149,12 @@ describe("_claude/backgroundTasks (brick cec4c064)", () => {
     await feed(t, [changed([task("b2", "local_bash", "sleep 150")])]);
     await feed(t, [changed([])]);
     const sent = bgPayloads(t.wire);
-    expect(sent.map((p) => p.tasks.map((x: any) => x.taskId))).toEqual([["a1"], ["a1", "b2"], ["b2"], []]);
+    expect(sent.map((p) => p.tasks.map((x: any) => x.taskId))).toEqual([
+      ["a1"],
+      ["a1", "b2"],
+      ["b2"],
+      [],
+    ]);
     const a1Start = sent[0].tasks[0].startedAt;
     expect(sent[1].tasks[0].startedAt).toBe(a1Start);
     expect(sent[1].tasks[1].startedAt).toBe(sent[1].at);
@@ -163,14 +184,30 @@ describe("_claude/backgroundTasks (brick cec4c064)", () => {
 
   it("toolName from task_started: included when it came first, re-sent with the name when it came second", async () => {
     const t = setup();
-    (t.agent as any).toolUseCache["toolu_mon"] = { type: "tool_use", id: "toolu_mon", name: "Monitor", input: {} };
-    (t.agent as any).toolUseCache["toolu_bash"] = { type: "tool_use", id: "toolu_bash", name: "Bash", input: {} };
+    (t.agent as any).toolUseCache["toolu_mon"] = {
+      type: "tool_use",
+      id: "toolu_mon",
+      name: "Monitor",
+      input: {},
+    };
+    (t.agent as any).toolUseCache["toolu_bash"] = {
+      type: "tool_use",
+      id: "toolu_bash",
+      name: "Bash",
+      input: {},
+    };
     // Monitor: task_started first.
-    await feed(t, [sys("task_started", { task_id: "m1", tool_use_id: "toolu_mon", description: "tail log" })]);
+    await feed(t, [
+      sys("task_started", { task_id: "m1", tool_use_id: "toolu_mon", description: "tail log" }),
+    ]);
     await feed(t, [changed([task("m1", "local_bash", "tail log")])]);
     // Bash: the set first, then task_started.
-    await feed(t, [changed([task("m1", "local_bash", "tail log"), task("b1", "local_bash", "sleep 150")])]);
-    await feed(t, [sys("task_started", { task_id: "b1", tool_use_id: "toolu_bash", description: "sleep 150" })]);
+    await feed(t, [
+      changed([task("m1", "local_bash", "tail log"), task("b1", "local_bash", "sleep 150")]),
+    ]);
+    await feed(t, [
+      sys("task_started", { task_id: "b1", tool_use_id: "toolu_bash", description: "sleep 150" }),
+    ]);
     const sent = bgPayloads(t.wire);
     expect(sent.map((p) => p.tasks.map((x: any) => [x.taskId, x.toolName ?? null]))).toEqual([
       [["m1", "Monitor"]],
@@ -215,7 +252,12 @@ describe("_claude/backgroundTasks per adapter process (D4, D5)", () => {
     it(`D4: ${entry} announces the current set once after the response (empty included)`, async () => {
       const t = setup();
       const agent = t.agent as any;
-      agent.createSession = async () => ({ sessionId: "s", models: {}, modes: {}, configOptions: [] });
+      agent.createSession = async () => ({
+        sessionId: "s",
+        models: {},
+        modes: {},
+        configOptions: [],
+      });
       agent.getOrCreateSession = async () => ({ models: {}, modes: {}, configOptions: [] });
       agent.replaySessionHistory = async () => {};
       agent.sendAvailableCommandsUpdate = () => {};

@@ -1406,7 +1406,11 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "task_started": {
-                await this.onBackgroundTaskStarted(message.task_id, message.tool_use_id, params.sessionId);
+                await this.onBackgroundTaskStarted(
+                  message.task_id,
+                  message.tool_use_id,
+                  params.sessionId,
+                );
                 if (message.tool_use_id) {
                   await this.onTeammateSpawned(
                     message.tool_use_id,
