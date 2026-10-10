@@ -292,6 +292,36 @@ export const PROMPT_ID_META_KEY = "_claude/promptId";
  *  - `phase: "completing"`, `lastTurnEndReason` — from the prompt loop just
  *    before it returns the response from SDK idle, or rejects the prompt. */
 export const PROMPT_LIFECYCLE_NOTIFICATION = "_claude/promptLifecycle";
+/** ext-notification (NOT a `session/update`; acpx keeps it off the activity
+ *  clock) carrying the session's live background-task set, sent whenever that
+ *  set changes, including to empty (brick cec4c064; acpx-ui design d4c1eb3f
+ *  §4.1). REPLACE semantics, the same as the SDK's `background_tasks_changed`;
+ *  ambient tasks are dropped. Payload:
+ *  `{ sessionId, at, tasks: [{ taskId, taskType, description, startedAt, toolName? }] }`
+ *  — `at` is this adapter's wall clock at the change, `startedAt` its first
+ *  sight of the task id (kept across later payloads), and `toolName` the tool
+ *  that started it, once `task_started` named one. */
+export const BACKGROUND_TASKS_NOTIFICATION = "_claude/backgroundTasks";
+
+type BackgroundTaskPayload = {
+  taskId: string;
+  taskType: string;
+  description: string;
+  startedAt: string;
+  toolName?: string;
+};
+
+/** Per-session state behind {@link BACKGROUND_TASKS_NOTIFICATION}. */
+type BackgroundTaskTracker = {
+  /** The live non-ambient set as last reported by the SDK, in its order. */
+  live: Array<{ taskId: string; taskType: string; description: string }>;
+  /** First sight of each live task id (ISO), so `startedAt` never moves. */
+  startedAt: Map<string, string>;
+  /** taskId → the originating tool's name, from `task_started.tool_use_id`. */
+  toolNames: Map<string, string>;
+  /** The last payload's tasks, serialized; a repeat is not sent. */
+  lastSentKey?: string;
+};
 
 /** ACP `session/set_config_option` id for the Claude Code output style.
  *  Deliberately IDENTICAL to the SDK `Settings` key `outputStyle`, so no
@@ -380,6 +410,8 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Created on first use by {@link ClaudeAcpAgent.onBackgroundTasksChanged}. */
+  backgroundTasks?: BackgroundTaskTracker;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -957,6 +989,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
       void this.sendEngineContextUpdate(response.sessionId);
+      void this.announceBackgroundTasks(response.sessionId);
     }, 0);
     return response;
   }
@@ -987,6 +1020,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
       void this.sendEngineContextUpdate(response.sessionId);
+      void this.announceBackgroundTasks(response.sessionId);
     }, 0);
     return response;
   }
@@ -1008,6 +1042,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
       void this.sendEngineContextUpdate(params.sessionId);
+      void this.announceBackgroundTasks(params.sessionId);
     }, 0);
     return result;
   }
@@ -1021,6 +1056,7 @@ export class ClaudeAcpAgent implements Agent {
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
       void this.sendEngineContextUpdate(params.sessionId);
+      void this.announceBackgroundTasks(params.sessionId);
     }, 0);
 
     return result;
@@ -1370,6 +1406,7 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "task_started": {
+                await this.onBackgroundTaskStarted(message.task_id, message.tool_use_id, params.sessionId);
                 if (message.tool_use_id) {
                   await this.onTeammateSpawned(
                     message.tool_use_id,
@@ -1461,9 +1498,11 @@ export class ClaudeAcpAgent implements Agent {
                 // simply aren't advertised until the next session load.
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "background_tasks_changed":
+                await this.onBackgroundTasksChanged(message.tasks, params.sessionId);
+                break;
               case "control_request_progress":
               case "model_refusal_no_fallback":
-              case "background_tasks_changed":
               case "worker_shutting_down":
               case "informational":
                 // New `system` subtypes surfaced by the bundled CC ≥2.1.219
@@ -1471,8 +1510,8 @@ export class ClaudeAcpAgent implements Agent {
                 // signals with no ACP surface today: `control_request_progress`
                 // (permission-request progress pings), `model_refusal_no_fallback`
                 // (a refusal the engine could NOT fall back from — distinct from
-                // `model_refusal_fallback` above, which it recovered), background-
-                // task lifecycle, worker shutdown, and free-form informational
+                // `model_refusal_fallback` above, which it recovered), worker
+                // shutdown, and free-form informational
                 // notices. Intentional no-op — keeping the switch exhaustive so a
                 // future SDK subtype is a compile error, not a silent drop.
                 break;
@@ -3789,6 +3828,11 @@ export class ClaudeAcpAgent implements Agent {
         break;
       }
       case "system": {
+        if (message.subtype === "background_tasks_changed") {
+          await this.onBackgroundTasksChanged(message.tasks, sessionId);
+        } else if (message.subtype === "task_started") {
+          await this.onBackgroundTaskStarted(message.task_id, message.tool_use_id, sessionId);
+        }
         if (message.subtype === "task_started" && message.tool_use_id) {
           await this.onTeammateSpawned(
             message.tool_use_id,
@@ -3815,6 +3859,114 @@ export class ClaudeAcpAgent implements Agent {
       }
       default:
         break;
+    }
+  }
+
+  /**
+   * `background_tasks_changed` (in a prompt or idle): replace the session's live
+   * set with the non-ambient tasks and forward it as
+   * {@link BACKGROUND_TASKS_NOTIFICATION}. Ambient tasks are not activity by the
+   * SDK's own definition, so a set that differs only in ambient tasks sends
+   * nothing.
+   */
+  private async onBackgroundTasksChanged(
+    tasks: Array<{ task_id: string; task_type: string; description: string; ambient?: boolean }>,
+    sessionId: string,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const tracker = (session.backgroundTasks ??= {
+      live: [],
+      startedAt: new Map(),
+      toolNames: new Map(),
+    });
+    const now = new Date().toISOString();
+    tracker.live = tasks
+      .filter((t) => t.ambient !== true)
+      .map((t) => ({ taskId: t.task_id, taskType: t.task_type, description: t.description }));
+    const liveIds = new Set(tracker.live.map((t) => t.taskId));
+    for (const id of tracker.live.map((t) => t.taskId)) {
+      if (!tracker.startedAt.has(id)) tracker.startedAt.set(id, now);
+    }
+    for (const id of [...tracker.startedAt.keys()]) {
+      if (!liveIds.has(id)) tracker.startedAt.delete(id);
+    }
+    for (const id of [...tracker.toolNames.keys()]) {
+      if (!liveIds.has(id)) tracker.toolNames.delete(id);
+    }
+    await this.sendBackgroundTasks(sessionId, tracker, now);
+  }
+
+  /**
+   * `task_started`: remember which tool started the task, so the payload can
+   * name it (Monitor vs a plain command). When the task is already in the live
+   * set (the SDK sent `background_tasks_changed` first), the set is re-sent with
+   * the name.
+   */
+  private async onBackgroundTaskStarted(
+    taskId: string,
+    toolUseId: string | undefined,
+    sessionId: string,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    const toolName = toolUseId ? this.toolUseCache[toolUseId]?.name : undefined;
+    if (!session || !toolName) return;
+    const tracker = (session.backgroundTasks ??= {
+      live: [],
+      startedAt: new Map(),
+      toolNames: new Map(),
+    });
+    tracker.toolNames.set(taskId, toolName);
+    if (tracker.live.some((t) => t.taskId === taskId)) {
+      await this.sendBackgroundTasks(sessionId, tracker, new Date().toISOString());
+    }
+  }
+
+  /**
+   * Once per session/new, load, resume and fork, after the response: send the current set — empty
+   * included, and even when it equals the last payload. A client learns that THIS adapter process
+   * forwards the set only from a payload it has seen since the process started (acpx-ui decides it
+   * per adapter process, at `initialize`); an announcement only on change left a respawned owner
+   * (idle release, recover, pod restart) reading as non-forwarding until its next background change
+   * — today's phantom "Running tool" at every turn start (test-engineer D4, brick cec4c064).
+   */
+  private async announceBackgroundTasks(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const tracker: BackgroundTaskTracker = (session.backgroundTasks ??= {
+      live: [],
+      startedAt: new Map(),
+      toolNames: new Map(),
+    });
+    tracker.lastSentKey = undefined;
+    await this.sendBackgroundTasks(sessionId, tracker, new Date().toISOString());
+  }
+
+  private async sendBackgroundTasks(
+    sessionId: string,
+    tracker: BackgroundTaskTracker,
+    at: string,
+  ): Promise<void> {
+    const tasks: BackgroundTaskPayload[] = tracker.live.map((t) => {
+      const toolName = tracker.toolNames.get(t.taskId);
+      return {
+        taskId: t.taskId,
+        taskType: t.taskType,
+        description: t.description,
+        startedAt: tracker.startedAt.get(t.taskId) ?? at,
+        ...(toolName && { toolName }),
+      };
+    });
+    const key = JSON.stringify(tasks);
+    if (key === tracker.lastSentKey) return;
+    try {
+      await this.client.extNotification(BACKGROUND_TASKS_NOTIFICATION, { sessionId, at, tasks });
+      // Recorded only once delivered: a failed send (above all of the EMPTY set, which would leave
+      // the client believing work is live until its 15-min ceiling) is re-sent at the next event
+      // instead of being deduplicated away (test-engineer D5, brick cec4c064).
+      tracker.lastSentKey = key;
+    } catch (err) {
+      this.logger.error(`Session ${sessionId}: failed to send background tasks:`, err);
     }
   }
 
