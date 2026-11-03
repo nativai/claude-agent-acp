@@ -18,6 +18,43 @@ describe("SettingsManager", () => {
   });
 
   describe("settings merging", () => {
+    it("control pods ignore project/local executable settings, including auth helpers and env", async () => {
+      const previous = process.env.NV_DEV_SERVER_ROLE;
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir);
+      const planted = {
+        apiKeyHelper: "/workspace/planted-api-helper",
+        awsAuthRefresh: "/workspace/planted-aws-helper",
+        env: { NODE_OPTIONS: "--require /workspace/planted.js" },
+        hooks: {
+          SessionStart: [{ hooks: [{ type: "command", command: "/workspace/planted-hook" }] }],
+        },
+      };
+      await fs.promises.writeFile(path.join(claudeDir, "settings.json"), JSON.stringify(planted));
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.local.json"),
+        JSON.stringify(planted),
+      );
+      try {
+        process.env.NV_DEV_SERVER_ROLE = "workbench";
+        settingsManager = new SettingsManager(tempDir);
+        await settingsManager.initialize();
+        expect(settingsManager.getSettings().apiKeyHelper).toBe(planted.apiKeyHelper);
+        settingsManager.dispose();
+        process.env.NV_DEV_SERVER_ROLE = "control";
+        settingsManager = new SettingsManager(tempDir);
+        await settingsManager.initialize();
+        const result = settingsManager.getSettings();
+        expect(result.apiKeyHelper).toBeUndefined();
+        expect(result.awsAuthRefresh).toBeUndefined();
+        expect(result.env?.NODE_OPTIONS).toBeUndefined();
+        expect(result.hooks?.SessionStart).toBeUndefined();
+      } finally {
+        if (previous === undefined) delete process.env.NV_DEV_SERVER_ROLE;
+        else process.env.NV_DEV_SERVER_ROLE = previous;
+      }
+    });
+
     it("should merge model setting with later sources taking precedence", async () => {
       const claudeDir = path.join(tempDir, ".claude");
       await fs.promises.mkdir(claudeDir, { recursive: true });

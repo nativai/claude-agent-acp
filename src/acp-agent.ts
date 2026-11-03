@@ -74,6 +74,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { SettingsManager } from "./settings.js";
+import { appendControlProjectMemory } from "./control-project-memory.js";
+import { isControlPod } from "./control-pod.js";
 import {
   applyTaskCreate,
   applyTaskUpdate,
@@ -3248,6 +3250,17 @@ export class ClaudeAcpAgent implements Agent {
       settingSources: ["user", "project", "local"],
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
+      // A project/local settings file can run more than hooks: auth helpers and
+      // subprocess env are executable too. Keep their instruction files as text.
+      ...(isControlPod()
+        ? {
+            settingSources: ["user"] as Options["settingSources"],
+            systemPrompt: await appendControlProjectMemory(
+              params.cwd,
+              userProvidedOptions?.systemPrompt ?? systemPrompt,
+            ),
+          }
+        : {}),
       // CLAUDE_MODEL_CONFIG env var is a fallback for model configuration
       // (e.g. Bedrock model ID overrides), and the effort-pin `env` block makes
       // a pinned reasoning effort win from turn 1 (see `creationSettings`).

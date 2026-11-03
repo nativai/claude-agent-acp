@@ -8,6 +8,7 @@ import {
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
+import { isControlPod } from "./control-pod.js";
 
 /**
  * Permission rule format examples:
@@ -47,6 +48,7 @@ export interface SettingsManagerOptions {
  * `filterEscalatingDefaultMode`, matching the CLI's trust policy.
  */
 export class SettingsManager {
+  private readonly controlPod = isControlPod();
   private cwd: string;
   private effective: Settings = {};
   private watchers: fs.FSWatcher[] = [];
@@ -92,8 +94,12 @@ export class SettingsManager {
   private getWatchedPaths(): string[] {
     return [
       path.join(CLAUDE_CONFIG_DIR, "settings.json"),
-      path.join(this.cwd, ".claude", "settings.json"),
-      path.join(this.cwd, ".claude", "settings.local.json"),
+      ...(this.controlPod
+        ? []
+        : [
+            path.join(this.cwd, ".claude", "settings.json"),
+            path.join(this.cwd, ".claude", "settings.local.json"),
+          ]),
       getManagedSettingsPath(),
     ];
   }
@@ -104,7 +110,10 @@ export class SettingsManager {
    */
   private async loadAllSettings(): Promise<void> {
     try {
-      const resolved = await resolveSettings({ cwd: this.cwd });
+      const resolved = await resolveSettings({
+        cwd: this.cwd,
+        settingSources: this.controlPod ? ["user"] : ["user", "project", "local"],
+      });
       this.effective = filterEscalatingDefaultMode(resolved);
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);

@@ -66,6 +66,50 @@ describe("createSession options merging", () => {
     agent = new ClaudeAcpAgent(createMockClient());
   });
 
+  it("control forces user-only settings after caller options and keeps project memory plus SDK hooks", async () => {
+    const previous = process.env.NV_DEV_SERVER_ROLE;
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "claude-control-options-"));
+    fs.writeFileSync(path.join(cwd, "CLAUDE.md"), "PROJECT_MEMORY_WITNESS");
+    fs.mkdirSync(path.join(cwd, ".claude"));
+    fs.writeFileSync(
+      path.join(cwd, ".claude/settings.json"),
+      JSON.stringify({ env: { NODE_OPTIONS: "--require /workspace/planted.js" } }),
+    );
+    process.env.NV_DEV_SERVER_ROLE = "control";
+    const platformHook = vi.fn(async () => ({}));
+    try {
+      await agent.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              settingSources: ["project", "local"],
+              systemPrompt: {
+                type: "preset",
+                preset: "claude_code",
+                append: "PLATFORM_PRIMER_WITNESS",
+              },
+              hooks: { PreToolUse: [{ hooks: [platformHook] }] },
+            },
+          },
+        },
+      });
+      expect(capturedOptions?.settingSources).toEqual(["user"]);
+      expect(JSON.stringify(capturedOptions?.systemPrompt)).toContain("PROJECT_MEMORY_WITNESS");
+      expect(JSON.stringify(capturedOptions?.systemPrompt)).toContain("PLATFORM_PRIMER_WITNESS");
+      expect(capturedOptions?.env?.NODE_OPTIONS).not.toBe("--require /workspace/planted.js");
+      expect(capturedOptions?.hooks?.PreToolUse?.[0]?.hooks).toContain(platformHook);
+      expect(capturedOptions?.hooks?.PostToolUse?.length).toBeGreaterThan(0);
+      expect(capturedOptions?.hooks?.TaskCreated?.length).toBeGreaterThan(0);
+      expect(capturedOptions?.hooks?.TaskCompleted?.length).toBeGreaterThan(0);
+    } finally {
+      if (previous === undefined) delete process.env.NV_DEV_SERVER_ROLE;
+      else process.env.NV_DEV_SERVER_ROLE = previous;
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
       cwd: "/test",
