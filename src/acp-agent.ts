@@ -1511,6 +1511,12 @@ export class ClaudeAcpAgent implements Agent {
               case "model_refusal_no_fallback":
               case "worker_shutting_down":
               case "informational":
+              case "session_writes_lost":
+                // `session_writes_lost` (new in the bundled CC ≥2.1.322,
+                // claude-agent-sdk 0.3.322): the CLI could not save transcript
+                // lines or ~/.claude.json changes (disk full / quota), sent once at
+                // exit and documented as safe to ignore. No ACP surface; no-op.
+                //
                 // New `system` subtypes surfaced by the bundled CC ≥2.1.219
                 // (claude-agent-sdk 0.3.219). All are operational/progress
                 // signals with no ACP surface today: `control_request_progress`
