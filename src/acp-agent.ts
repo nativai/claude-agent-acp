@@ -371,6 +371,14 @@ type Session = {
   activePromptId?: string;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
+  /** brick 21b73df0 — the uuids of parked prompts a `cancel()` answered `cancelled`. Their messages are already in
+   *  the SDK input (`prompt()` pushes before it parks) and cannot be taken back, so the SDK runs each as a turn of
+   *  its own after the interrupt. The reader recognises that turn by its user replay and withdraws it
+   *  (`discardWithdrawnTurnMessage`). Optional: sessions built without it (tests) get it on first cancel. */
+  withdrawnPromptUuids?: Set<string>;
+  /** brick 21b73df0 — true from a withdrawn prompt's replay until its turn's idle: the turn is being interrupted and
+   *  nothing of it reaches the client; `canUseTool` denies every tool it asks for. */
+  discardingWithdrawnTurn?: boolean;
   abortController: AbortController;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Resolve callback for the active prompt's current nextMessage() call. null when idle. */
@@ -2155,7 +2163,9 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     session.cancelled = true;
-    for (const [, pending] of session.pendingMessages) {
+    for (const [uuid, pending] of session.pendingMessages) {
+      // brick 21b73df0 — answering `cancelled` does not take the message back: it is already in the SDK input.
+      (session.withdrawnPromptUuids ??= new Set()).add(uuid);
       pending.resolve(true);
     }
     session.pendingMessages.clear();
@@ -2492,6 +2502,11 @@ export class ClaudeAcpAgent implements Agent {
           behavior: "deny",
           message: "Session not found",
         };
+      }
+      // brick 21b73df0 — a withdrawn prompt's turn (the person stopped it) never runs a tool, even if a tool use
+      // reaches this point before the interrupt lands.
+      if (session.discardingWithdrawnTurn) {
+        return { behavior: "deny", message: "The user stopped this turn.", interrupt: true };
       }
 
       if (toolName === "ExitPlanMode") {
@@ -3643,6 +3658,57 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   /**
+   * brick 21b73df0 — a person's Stop must stop a prompt that was parked (steered) behind the stopped turn.
+   *
+   * `prompt()` pushes a concurrent prompt's message into the SDK input at once and parks; `cancel()` answers it
+   * `cancelled` and interrupts the running turn. The message stays queued inside Claude Code, which then runs it as a
+   * turn of its own: measured on the real adapter, the steered tool call ran and its file was written ~2-6 s after
+   * the client had settled the turn idle (brick 21b73df0 DIAGNOSIS.md). Such a turn opens with the replay of the
+   * withdrawn uuid. From there to its `session_state_changed: idle` this drops every message (none reaches the
+   * client or a prompt loop — a loop that took this idle would end ITS turn early) and interrupts the turn.
+   *
+   * ⚠️ Do NOT end the discard on the turn's `result`, nor on any user message: tool results are user messages, and
+   * the idle follows the result. The discard ends early only on the replay of ANOTHER prompt (`isReplay`), which
+   * means the SDK has moved on to a new turn without an idle. src/tests/cancel-withdraws-parked.test.ts covers both.
+   * Returns true when the message was dropped.
+   */
+  private discardWithdrawnTurnMessage(
+    sessionId: string,
+    session: Session,
+    message: SDKMessage,
+  ): boolean {
+    const replayUuid =
+      message.type === "user" && "uuid" in message && typeof message.uuid === "string"
+        ? message.uuid
+        : undefined;
+    if (replayUuid !== undefined && session.withdrawnPromptUuids?.delete(replayUuid)) {
+      session.discardingWithdrawnTurn = true;
+      void session.query.interrupt().catch((err) => {
+        this.logger.error(
+          `Session ${sessionId}: failed to interrupt a withdrawn prompt's turn:`,
+          err,
+        );
+      });
+      return true;
+    }
+    if (!session.discardingWithdrawnTurn) {
+      return false;
+    }
+    if (replayUuid !== undefined && "isReplay" in message && message.isReplay === true) {
+      session.discardingWithdrawnTurn = false;
+      return false;
+    }
+    if (
+      message.type === "system" &&
+      message.subtype === "session_state_changed" &&
+      message.state === "idle"
+    ) {
+      session.discardingWithdrawnTurn = false;
+    }
+    return true;
+  }
+
+  /**
    * Persistent background reader loop: the sole consumer of session.query.
    * Routes each message to the active prompt handler (if one is running) or
    * processes it as an idle inter-turn update (subagent activity after end_turn).
@@ -3655,6 +3721,10 @@ export class ClaudeAcpAgent implements Agent {
       try {
         while (true) {
           const { value, done } = await session.query.next();
+
+          if (value && this.discardWithdrawnTurnMessage(sessionId, session, value)) {
+            continue;
+          }
 
           if (done || !value) {
             // Session ended — wake any waiting prompt so it can return/throw.
