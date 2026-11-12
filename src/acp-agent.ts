@@ -2248,7 +2248,13 @@ export class ClaudeAcpAgent implements Agent {
           `${parked.length} parked prompt(s) fall back to being stopped after they start`,
       );
     }
-    const receiptPromise = interrupt.call(session.query, { cancelQueued: true });
+    // A mock (or a CLI) may answer synchronously, with a non-promise, or throw: normalise to one promise.
+    let receiptPromise: Promise<{ still_queued?: string[]; cancelled?: string[] } | undefined>;
+    try {
+      receiptPromise = Promise.resolve(interrupt.call(session.query, { cancelQueued: true }));
+    } catch (err) {
+      receiptPromise = Promise.reject(err);
+    }
     let taken: string[] = [];
     try {
       const receipt = await Promise.race([
@@ -2258,8 +2264,8 @@ export class ClaudeAcpAgent implements Agent {
         }),
       ]);
       taken = Array.isArray(receipt?.cancelled) ? receipt.cancelled : [];
-    } catch (err) {
-      this.logger.error(`Session ${sessionId}: interrupt (cancelQueued) failed:`, err);
+    } catch {
+      // Re-raised below, once every parked prompt has its answer.
     } finally {
       for (const [uuid, pending] of parked) {
         if (taken.includes(uuid)) {
@@ -2270,7 +2276,8 @@ export class ClaudeAcpAgent implements Agent {
         pending.resolve(true);
       }
     }
-    await receiptPromise.catch(() => {});
+    // As the plain `await query.interrupt()` did: a failed interrupt fails the cancel.
+    await receiptPromise;
   }
 
   /** Cleanly tear down a session: cancel in-flight work, dispose resources,
