@@ -197,7 +197,7 @@ async function steerThenStop(t: ReturnType<typeof setup>) {
   expect(r2).not.toBe(WEDGE);
   expect(r1.stopReason).toBe("cancelled");
   expect(r2.stopReason).toBe("cancelled");
-  return { m2, interruptsAtStop: t.query.interrupt.mock.calls.length };
+  return { m2, r2, interruptsAtStop: t.query.interrupt.mock.calls.length };
 }
 
 /** What the real CLI emits after the interrupt: the withdrawn message's own turn. */
@@ -222,7 +222,52 @@ async function sdkRunsWithdrawnTurn(
   }
 }
 
-describe("21b73df0 — a Stop withdraws a parked (steered) prompt", () => {
+describe("21b73df0 — Claude Code confirms the withdrawal (interrupt receipt)", () => {
+  it("the Stop interrupts with cancelQueued, and a parked prompt Claude Code took back answers cancelled + _meta.withdrawn", async () => {
+    const t = setup();
+    t.query.interrupt.mockImplementation(async () => ({
+      still_queued: [],
+      cancelled: t.pushed.slice(1).map((m: any) => m.uuid),
+    }));
+    const { r2 } = await steerThenStop(t);
+    expect(t.query.interrupt).toHaveBeenCalledWith({ cancelQueued: true });
+    expect(r2).toEqual({ stopReason: "cancelled", _meta: { withdrawn: true } });
+  });
+
+  it("a parked prompt the receipt does not list answers a plain cancelled (never an inferred withdrawal)", async () => {
+    const t = setup();
+    t.query.interrupt.mockImplementation(async () => ({ still_queued: [], cancelled: [] }));
+    const { r2, m2, interruptsAtStop } = await steerThenStop(t);
+    expect(r2).toEqual({ stopReason: "cancelled" });
+    // ...and if Claude Code does run it, the reader still stops that turn.
+    const updatesAtStop = t.updates.length;
+    await sdkRunsWithdrawnTurn(t, m2);
+    expect(t.query.interrupt.mock.calls.length).toBe(interruptsAtStop + 1);
+    expect(t.updates.slice(updatesAtStop)).toEqual([]);
+  });
+
+  it("a receipt that never comes does not wedge the parked prompt: it answers a plain cancelled after the bound", async () => {
+    const t = setup();
+    t.query.interrupt.mockImplementation(() => new Promise(() => {}));
+    const p1 = t.prompt("run the long check");
+    await flush();
+    const p2 = t.prompt("also write the file");
+    await flush();
+    void t.agent.cancel({ sessionId: "s" });
+    const r2 = await settledOr(p2, 3_000);
+    expect(r2).not.toBe(WEDGE);
+    expect(r2).toEqual({ stopReason: "cancelled" });
+    expect(await settledOr(p1, 100)).not.toBe(WEDGE);
+  });
+});
+
+describe("21b73df0 — fallback, no receipt (an older Claude Code): the withdrawn prompt's turn is stopped when it starts", () => {
+  it("the parked prompt answers a plain cancelled", async () => {
+    const t = setup();
+    const { r2 } = await steerThenStop(t);
+    expect(r2).toEqual({ stopReason: "cancelled" });
+  });
+
   it("the turn the SDK runs for the withdrawn message is interrupted, and nothing of it reaches the client", async () => {
     const t = setup();
     const { m2, interruptsAtStop } = await steerThenStop(t);
