@@ -233,6 +233,18 @@ export const RESUME_HEARTBEAT_MS = 5_000;
 export const INIT_HARD_MS = 300_000;
 export const WEDGE_DISPLAY_MS = 90_000;
 
+/** brick 21b73df0 — the `_meta` key of a parked prompt's `cancelled` response when Claude Code confirmed it took the
+ *  message back before running it: `{"stopReason":"cancelled","_meta":{"withdrawn":true}}`. acpx reads it. */
+export const WITHDRAWN_META_KEY = "withdrawn";
+
+/** brick 21b73df0 — how long a Stop waits for Claude Code's interrupt receipt before answering the parked prompts
+ *  without it (each then answers a plain `cancelled`, and the reader's fallback stops any turn it starts). */
+const WITHDRAW_RECEIPT_WAIT_MS = 2_000;
+
+/** brick 21b73df0 — the `system/init` capability that says `interrupt({ cancelQueued: true })` is honoured.
+ *  Pinned against a real Claude Code by src/tests/sdk-cancel-queued-contract.test.ts. */
+const CANCEL_QUEUED_CAPABILITY = "interrupt_cancel_queued_v1";
+
 /**
  * Hard cap on `session.pendingSdkMessages` (the mid-await SDK-message buffer
  * introduced to close the `activePromptResolve` routing hole — CONCEPTION §1.1
@@ -371,11 +383,17 @@ type Session = {
   activePromptId?: string;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
-  /** brick 21b73df0 — the uuids of parked prompts a `cancel()` answered `cancelled`. Their messages are already in
-   *  the SDK input (`prompt()` pushes before it parks) and cannot be taken back, so the SDK runs each as a turn of
-   *  its own after the interrupt. The reader recognises that turn by its user replay and withdraws it
+  /** brick 21b73df0 — parked prompts a `cancel()` answered `cancelled` WITHOUT Claude Code confirming it took their
+   *  message back (an older CLI, or a message it had already dequeued). Claude Code may still run such a message as
+   *  a turn of its own; the reader recognises that turn by its user replay and stops it
    *  (`discardWithdrawnTurnMessage`). Optional: sessions built without it (tests) get it on first cancel. */
   withdrawnPromptUuids?: Set<string>;
+  /** brick 21b73df0 — parked prompts whose message Claude Code confirmed it removed before running it (the
+   *  interrupt receipt's `cancelled` list). Their response carries `_meta.withdrawn: true`. */
+  confirmedWithdrawnUuids?: Set<string>;
+  /** brick 21b73df0 — the `capabilities` Claude Code advertised on its `system/init`, read by the background reader.
+   *  Undefined until the first init. */
+  cliCapabilities?: string[];
   /** brick 21b73df0 — true from a withdrawn prompt's replay until its turn's idle: the turn is being interrupted and
    *  nothing of it reaches the client; `canUseTool` denies every tool it asks for. */
   discardingWithdrawnTurn?: boolean;
@@ -1171,6 +1189,11 @@ export class ClaudeAcpAgent implements Agent {
         session.pendingMessages.set(promptUuid, { resolve, order });
       });
       if (cancelled) {
+        // brick 21b73df0 — positive evidence only: Claude Code itself listed this message as cancelled before it ran.
+        // Never inferred from an absence: an unconfirmed withdrawal answers a plain `cancelled`.
+        if (session.confirmedWithdrawnUuids?.delete(promptUuid)) {
+          return { stopReason: "cancelled", _meta: { [WITHDRAWN_META_KEY]: true } };
+        }
         return { stopReason: "cancelled" };
       }
       // A2: reset now — the running turn has ended and this prompt is taking
@@ -2163,11 +2186,9 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     session.cancelled = true;
-    for (const [uuid, pending] of session.pendingMessages) {
-      // brick 21b73df0 — answering `cancelled` does not take the message back: it is already in the SDK input.
-      (session.withdrawnPromptUuids ??= new Set()).add(uuid);
-      pending.resolve(true);
-    }
+    // brick 21b73df0 — the parked prompts are answered once Claude Code's interrupt receipt says which of their
+    // messages it took back (below); taken out of the map now, so no handoff can resolve them meanwhile.
+    const parked = [...session.pendingMessages.entries()];
     session.pendingMessages.clear();
     // Discard any buffered mid-await SDK messages (A1 lifecycle rule): cancel
     // throws away in-flight turn state, mirroring the query.interrupt() stale
@@ -2187,7 +2208,69 @@ export class ClaudeAcpAgent implements Agent {
       session.activePromptResolve = null;
       resolve(null);
     }
-    await session.query.interrupt();
+    await this.interruptWithdrawingParked(params.sessionId, session, parked);
+  }
+
+  /**
+   * brick 21b73df0 — a person's Stop stops the running turn AND every prompt parked behind it.
+   *
+   * `prompt()` pushed each parked prompt's message into the SDK input before parking, so Claude Code holds it in its
+   * own queue: answering the prompt `cancelled` alone left it there, and Claude Code ran it right after the
+   * interrupt (measured: the steered tool call ran and its file was written seconds after the client read the turn
+   * idle). `cancelQueued` makes the same interrupt remove those messages; the receipt's `cancelled` lists the uuids
+   * Claude Code took back, and none of them runs. Each such prompt answers `cancelled` with `_meta.withdrawn: true`.
+   * A parked prompt the receipt does not list (an older CLI ignores the option; a message already dequeued) answers a
+   * plain `cancelled`, and the reader stops its turn if one starts (`discardWithdrawnTurnMessage`).
+   *
+   * ⚠️ Do NOT go back to a plain `interrupt()` here: the parked messages run again. And do not await the receipt
+   * unbounded: a wedged CLI never answers, and the parked prompts would never return.
+   * src/tests/cancel-withdraws-parked.test.ts covers both.
+   */
+  private async interruptWithdrawingParked(
+    sessionId: string,
+    session: Session,
+    parked: Array<[string, { resolve: (cancelled: boolean) => void; order: number }]>,
+  ): Promise<void> {
+    // The option and the receipt's `cancelled` exist at runtime (SDK 0.3.322, capability `interrupt_cancel_queued_v1`)
+    // but not in its typings, hence this one narrow view of the method.
+    const interrupt = session.query.interrupt as unknown as (options: {
+      cancelQueued: true;
+    }) => Promise<{ still_queued?: string[]; cancelled?: string[] } | undefined>;
+    if (
+      parked.length > 0 &&
+      session.cliCapabilities !== undefined &&
+      !session.cliCapabilities.includes(CANCEL_QUEUED_CAPABILITY)
+    ) {
+      // Feature detection: this Claude Code ignores `cancelQueued`. The Stop still answers every parked prompt, and
+      // the reader stops each one's turn once it starts — later, and without the `withdrawn` flag.
+      this.logger.error(
+        `Session ${sessionId}: Claude Code does not advertise ${CANCEL_QUEUED_CAPABILITY}; ` +
+          `${parked.length} parked prompt(s) fall back to being stopped after they start`,
+      );
+    }
+    const receiptPromise = interrupt.call(session.query, { cancelQueued: true });
+    let taken: string[] = [];
+    try {
+      const receipt = await Promise.race([
+        receiptPromise,
+        new Promise<undefined>((resolve) => {
+          setTimeout(() => resolve(undefined), WITHDRAW_RECEIPT_WAIT_MS).unref?.();
+        }),
+      ]);
+      taken = Array.isArray(receipt?.cancelled) ? receipt.cancelled : [];
+    } catch (err) {
+      this.logger.error(`Session ${sessionId}: interrupt (cancelQueued) failed:`, err);
+    } finally {
+      for (const [uuid, pending] of parked) {
+        if (taken.includes(uuid)) {
+          (session.confirmedWithdrawnUuids ??= new Set()).add(uuid);
+        } else {
+          (session.withdrawnPromptUuids ??= new Set()).add(uuid);
+        }
+        pending.resolve(true);
+      }
+    }
+    await receiptPromise.catch(() => {});
   }
 
   /** Cleanly tear down a session: cancel in-flight work, dispose resources,
@@ -3722,6 +3805,12 @@ export class ClaudeAcpAgent implements Agent {
         while (true) {
           const { value, done } = await session.query.next();
 
+          if (value?.type === "system" && value.subtype === "init") {
+            const capabilities = (value as { capabilities?: unknown }).capabilities;
+            session.cliCapabilities = Array.isArray(capabilities)
+              ? capabilities.filter((c): c is string => typeof c === "string")
+              : [];
+          }
           if (value && this.discardWithdrawnTurnMessage(sessionId, session, value)) {
             continue;
           }
