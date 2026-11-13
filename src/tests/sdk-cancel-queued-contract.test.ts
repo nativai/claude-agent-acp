@@ -36,7 +36,9 @@ function userMessage(text: string, uuid: string): SDKUserMessage {
   } as SDKUserMessage;
 }
 
-async function stopWithQueuedMessage(cancelQueued: boolean) {
+// `chain3` (brick 21b73df0, the template-fork shape): A (the fork notice) runs a short tool; B arrives during A, is
+// folded into A's turn at the tool boundary and runs a long command; C is queued behind it; then the Stop.
+async function stopWithQueuedMessage(cancelQueued: boolean, chain3 = false) {
   const input = new Pushable<SDKUserMessage>();
   const q = query({
     prompt: input,
@@ -46,7 +48,10 @@ async function stopWithQueuedMessage(cancelQueued: boolean) {
       includePartialMessages: true,
       settingSources: [],
       env: { ...process.env, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
-      canUseTool: async () => ({ behavior: "deny", message: "no tools in this test" }),
+      canUseTool: async (_name, toolInput) =>
+        chain3
+          ? { behavior: "allow", updatedInput: toolInput }
+          : { behavior: "deny", message: "no tools in this test" },
     },
   });
   const seen: SDKMessage[] = [];
@@ -58,17 +63,56 @@ async function stopWithQueuedMessage(cancelQueued: boolean) {
   const queued = randomUUID();
   const nonce = `withdrawn-${randomUUID().slice(0, 8)}`;
   try {
-    input.push(
-      userMessage(
-        "Write the numbers from one to four hundred as words, one per line. Use no tools.",
-        randomUUID(),
-      ),
-    );
-    await waitUntil(
-      () => seen.some((m) => m.type === "stream_event" || m.type === "assistant"),
-      90_000,
-      "the first turn is generating",
-    );
+    if (chain3) {
+      const notice = randomUUID();
+      input.push(
+        userMessage(
+          "Run this shell command with your Bash tool: echo fork-notice-read — then wait for further instructions.",
+          notice,
+        ),
+      );
+      await waitUntil(
+        () =>
+          seen.some((m) => {
+            const lifecycle = m as { type: string; command_uuid?: string; state?: string };
+            return (
+              lifecycle.type === "command_lifecycle" &&
+              lifecycle.command_uuid === notice &&
+              lifecycle.state === "started"
+            );
+          }),
+        90_000,
+        "the notice's turn started",
+      );
+      input.push(
+        userMessage(
+          "Run this exact command in the FOREGROUND with your Bash tool and wait until it ends: timeout 90 tail -f /dev/null",
+          randomUUID(),
+        ),
+      );
+      await waitUntil(
+        () =>
+          seen.some(
+            (m) =>
+              m.type === "assistant" && JSON.stringify(m.message.content).includes("timeout 90"),
+          ),
+        90_000,
+        "the second message's long command is running",
+      );
+      await sleep(1_500);
+    } else {
+      input.push(
+        userMessage(
+          "Write the numbers from one to four hundred as words, one per line. Use no tools.",
+          randomUUID(),
+        ),
+      );
+      await waitUntil(
+        () => seen.some((m) => m.type === "stream_event" || m.type === "assistant"),
+        90_000,
+        "the first turn is generating",
+      );
+    }
     input.push(userMessage(`Reply with exactly this one word: ${nonce}`, queued));
     await waitUntil(
       () =>
@@ -123,6 +167,15 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
 
     // Positive control: the detector above SEES a run when one happens. A plain interrupt leaves the queued message
     // in place (`still_queued`), and Claude Code runs it right after: the very defect a Stop used to leave.
+    // The template-fork chain (brick 21b73df0): the queued message is the THIRD, behind a message folded into the
+    // notice's turn. Measured: withdrawn exactly as in the two-message case.
+    it("three-message chain: the third message is listed cancelled and never runs", async () => {
+      const run = await stopWithQueuedMessage(true, true);
+      expect(run.receipt?.cancelled).toContain(run.queued);
+      expect(run.replayed).toBe(false);
+      expect(run.answered).toBe(false);
+    }, 240_000);
+
     it("control: a plain interrupt lists it under still_queued, and Claude Code then runs it", async () => {
       const run = await stopWithQueuedMessage(false);
       expect(run.receipt?.still_queued).toContain(run.queued);

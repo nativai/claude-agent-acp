@@ -2264,6 +2264,14 @@ export class ClaudeAcpAgent implements Agent {
         }),
       ]);
       taken = Array.isArray(receipt?.cancelled) ? receipt.cancelled : [];
+      if (parked.length > 0) {
+        // brick 21b73df0 — the Stop's evidence: which parked prompts Claude Code took back.
+        this.logger.log(
+          `[claude-agent-acp] session ${sessionId}: Stop with ${parked.length} parked prompt(s); ` +
+            `receipt ${receipt === undefined ? "none" : JSON.stringify({ cancelled: receipt.cancelled ?? null, still_queued: receipt.still_queued ?? null })}; ` +
+            `withdrawn ${parked.filter(([uuid]) => taken.includes(uuid)).length}/${parked.length}`,
+        );
+      }
     } catch {
       // Re-raised below, once every parked prompt has its answer.
     } finally {
@@ -3817,6 +3825,12 @@ export class ClaudeAcpAgent implements Agent {
             session.cliCapabilities = Array.isArray(capabilities)
               ? capabilities.filter((c): c is string => typeof c === "string")
               : [];
+            // brick 21b73df0 — one line per init, so a rig can PROVE which Stop path a session has.
+            const version = (value as { claude_code_version?: unknown }).claude_code_version;
+            this.logger.log(
+              `[claude-agent-acp] session ${sessionId}: Claude Code ${typeof version === "string" ? version : "unknown"}, ` +
+                `${CANCEL_QUEUED_CAPABILITY} ${session.cliCapabilities.includes(CANCEL_QUEUED_CAPABILITY) ? "present" : "absent"}`,
+            );
           }
           if (value && this.discardWithdrawnTurnMessage(sessionId, session, value)) {
             continue;

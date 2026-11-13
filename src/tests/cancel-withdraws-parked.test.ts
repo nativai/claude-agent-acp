@@ -374,3 +374,30 @@ describe("21b73df0 — fallback, no receipt (an older Claude Code): the withdraw
     ).toBe(true);
   });
 });
+
+describe("21b73df0 — the init capability line (so a rig can prove which Stop path a session has)", () => {
+  for (const present of [true, false]) {
+    it(`logs interrupt_cancel_queued_v1 ${present ? "present" : "absent"}`, async () => {
+      const mq = manualQuery();
+      const lines: string[] = [];
+      const spy = { log: (m: string) => lines.push(String(m)), error: () => {} };
+      const agent = new ClaudeAcpAgent(recordingClient().client, spy);
+      const input = { push: vi.fn(), end: vi.fn() } as any;
+      agent.sessions["s"] = makeSession(mq.query, input) as any;
+      (agent as any).startBackgroundReaderLoop("s");
+      mq.push({
+        type: "system",
+        subtype: "init",
+        claude_code_version: "2.1.322",
+        capabilities: present
+          ? ["interrupt_receipt_v1", "interrupt_cancel_queued_v1"]
+          : ["interrupt_receipt_v1"],
+        session_id: "s",
+      });
+      await flush();
+      expect(lines).toContain(
+        `[claude-agent-acp] session s: Claude Code 2.1.322, interrupt_cancel_queued_v1 ${present ? "present" : "absent"}`,
+      );
+    });
+  }
+});
